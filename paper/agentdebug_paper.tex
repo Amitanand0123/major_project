@@ -1,0 +1,950 @@
+\documentclass{ieeeaccess}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{ragged2e}
+\usepackage{placeins}
+\usepackage{multirow}
+\usepackage[hyphens]{url}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{needspace}
+
+% Prevent text from overflowing column boundaries
+\emergencystretch=1em
+\tolerance=1000
+\hyphenpenalty=50
+
+\begin{document}
+
+\history{Date of publication xxxx 00, 0000, date of current version xxxx 00, 0000.}
+\doi{10.1109/ACCESS.2026.XXXXXXX}
+
+\title{AgentDebug: Dual-Channel Error Detection for LLM Agents on Software Engineering Tasks}
+
+\author{
+\uppercase{Amit Anand}\authorrefmark{1},
+\uppercase{Yash Aggarwal}\authorrefmark{2},
+\uppercase{Krishn Kant Kumar}\authorrefmark{3},
+\uppercase{Rajendra Kachhava}\authorrefmark{4}
+}
+
+\address[1]{Department of Computer Science and Engineering, Indian Institute of Information Technology, Kota, Rajasthan, India (e-mail: 2023kucp1060@iiitkota.ac.in)}
+\address[2]{Department of Computer Science and Engineering, Indian Institute of Information Technology, Kota, Rajasthan, India (e-mail: 2023kucp1057@iiitkota.ac.in)}
+\address[3]{Department of Computer Science and Engineering, Indian Institute of Information Technology, Kota, Rajasthan, India (e-mail: 2023kucp1070@iiitkota.ac.in)}
+\address[4]{Faculty, Department of Computer Science and Engineering, Indian Institute of Information Technology, Kota, Rajasthan, India (e-mail: rajendrakachhava@gmail.com)}
+
+\markboth{Anand \headeretal: AgentDebug: Dual-Channel Error Detection for LLM Agents}{Anand \headeretal: AgentDebug}
+
+\begin{abstract}
+Large Language Model (LLM) agents show strong promise in software engineering, but we still do not have a clear picture of how and why they fail. Existing analysis methods typically rely on human annotation or commercial API calls, and none of them examine errors from more than one angle. In this paper we introduce AgentDebug, a hybrid framework that runs two independent detection channels, one based on 95 hand-crafted regex patterns and the other on a locally hosted LLM, over every step of an agent trajectory. Applying this dual-channel pipeline to 300 SWE-bench trajectories (8,524 steps, 42,620 module-level comparisons), we find that the LLM channel flags 13,616 errors while the regex channel catches only 1,662, an 8.2$\times$ gap that shows most agent mistakes are semantic rather than syntactic. The two channels agree on the state of a given module 69.1\% of the time, yet whenever both flag the same module they never assign the same error type, confirming that pattern matching and language-model reasoning capture fundamentally different facets of failure. We also uncover a module-level asymmetry: regex patterns over-represent Action-module errors (53.1\%) relative to the LLM channel (40.1\%), while under-representing cognitive errors in Planning, Reflection, and Memory. All inference runs locally through Ollama with Qwen2.5-Coder:7B on a consumer-grade Windows machine, making the pipeline easy to replicate and scale without API dependencies. We release all code and data to support further work on building more reliable LLM agents.
+\end{abstract}
+
+\begin{keywords}
+LLM Agents, Error Detection, Software Engineering, SWE-bench, Dual-Channel Detection, Counterfactual Reasoning, Error Taxonomy, Pattern Matching, Local LLM Inference
+\end{keywords}
+
+\titlepgskip=-15pt
+
+\maketitle
+
+
+% ============================================================
+% I. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:introduction}
+
+\PARstart{L}{arge} Language Model agents are increasingly being deployed to tackle real-world software engineering problems. Benchmarks such as SWE-bench \cite{b1} give us a controlled way to measure how well these agents handle genuine GitHub issues, while frameworks like ReAct \cite{b2}, SWE-agent \cite{b3}, and AutoCodeRover \cite{b4} continue to push the boundaries of what automated coding assistants can do. Yet most of this effort goes toward making agents perform better; comparatively little attention has been paid to understanding the specific ways in which they break down during execution.
+
+The analysis tools that do exist share two shortcomings. First, they carry nontrivial overhead: the AgentErrorBench study, for instance, required ten expert annotators for 200 trajectories \cite{b5}, and API-based detection with GPT-4 costs roughly \$150--\$200 per thousand trajectories. Those costs are manageable for well-funded labs, but they do add up for groups running on tighter budgets. On top of that, every approach we are aware of uses just one detection method, which makes it hard to tell what that method is blind to.
+
+AgentDebug tackles both problems at once. It runs two detection channels in parallel over every step of an agent trajectory: a deterministic regex channel built from 95 patterns that catch syntactic error signatures, and a semantic channel powered by a locally hosted LLM (Qwen2.5-Coder:7B via Ollama). Because the two channels operate independently, we can directly compare what each one finds and measure how much they disagree.
+
+\subsection{Motivation}
+
+Three observations drove this work:
+
+\begin{enumerate}
+    \item \textbf{Silent failures are common.} During our initial experiments we noticed that agents often write code that parses without errors yet does the wrong thing, for example patching the wrong file or wandering outside the scope of the task. Regex patterns are unlikely to catch such mistakes, whereas an LLM that reads the surrounding context can.
+
+    \item \textbf{Accessibility.} Prior work used commercial APIs like GPT-4, which is a perfectly reasonable choice but does introduce per-call costs that scale with dataset size. Running a 7B model locally removes that variable, making it easier to iterate and scale up without worrying about the bill.
+
+    \item \textbf{Detection gaps are underexplored.} Pattern-based detection works well for what it covers, but there has been limited effort to quantify what it misses. Pairing it with an LLM channel gave us a way to begin measuring that gap.
+\end{enumerate}
+
+\subsection{Research Questions}
+
+Our investigation is organized around four questions:
+
+\begin{itemize}
+    \item \textbf{RQ1:} What types and frequencies of errors do LLM agents exhibit on software engineering tasks, and how are those errors spread across cognitive modules?
+    \item \textbf{RQ2:} To what extent do pattern-based and LLM-based detection agree, and where do their blind spots lie?
+    \item \textbf{RQ3:} Which errors actually cause trajectories to fail, and does an error being common make it more likely to be the root cause?
+    \item \textbf{RQ4:} What concrete changes to agent architectures would reduce the failure patterns we observe?
+\end{itemize}
+
+\subsection{Approach Overview}
+
+AgentDebug works in two phases:
+
+\textbf{Phase~1 (Dual-Channel Detection).} Every step in a trajectory is fed to both channels simultaneously. The regex channel scans the agent's output and environment feedback against 95 patterns; the LLM channel reads the same context and classifies errors across all five cognitive modules. For each step-module pair we record whether both channels found an error (\texttt{both\_error}), neither did (\texttt{both\_clean}), or only one of them did (\texttt{regex\_only} or \texttt{llm\_only}).
+
+\textbf{Phase~2 (Root-Cause Identification).} A second pass uses the local LLM to perform counterfactual reasoning over the Phase~1 results, asking which single error, if removed, would most likely have let the agent succeed. We pass the output through three validation layers that map most results onto a valid taxonomy entry, though a small fraction still escape (see Section~\ref{sec:methodology}).
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{Dual-channel detection.} We are, to our knowledge, the first to apply two independent detection methods to every step of an LLM agent trajectory. On 300 SWE-bench trajectories the LLM channel finds 8.2$\times$ more errors than the regex channel, and the two agree at the module level 69.1\% of the time, but never on error type.
+
+    \item \textbf{Code-domain error taxonomy.} We extend the AgentErrorTaxonomy of Zhu~et~al.\ \cite{b5} with 20 error types grouped into 5 cognitive modules (19 predefined plus one emergent type, \texttt{wrong\_file\_edit}, surfaced by the LLM channel), providing the first structured vocabulary designed specifically for code-agent failure analysis.
+
+    \item \textbf{Module-level asymmetry.} We show that regex patterns systematically over-represent Action and System errors (62.4\% combined) while under-representing cognitive errors (37.6\% vs.\ 58.7\% on the LLM side), an asymmetry that could skew the conclusions of any study relying on patterns alone.
+
+    \item \textbf{Zero-cost, consumer-hardware pipeline.} The entire analysis (300 trajectories, 8,524 steps, roughly 70 hours of LLM inference) ran on a Windows~11 laptop with 16\,GB RAM at \$0.00 in API fees.
+
+    \item \textbf{Actionable findings.} The error distributions point to specific interventions: AST-based pre-validation for the 31.5\% of regex errors that are \texttt{syntax\_\allowbreak{}error}, scope-aware editing for the 22.5\% of LLM errors that are \texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit}, and persistent context registries for recurring memory lapses.
+\end{enumerate}
+
+
+% ============================================================
+% II. RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{LLM Agents for Software Engineering}
+
+SWE-bench \cite{b1} set the standard for evaluating coding agents on real GitHub issues, and follow-up work such as SWE-bench+ \cite{b16} has refined the benchmark to address data-leakage concerns. Various architectures such as ReAct \cite{b2}, SWE-agent \cite{b3}, AutoCodeRover \cite{b4}, and OpenHands \cite{b13} have explored different prompting and tool-use strategies to improve resolution rates. Wang~et~al.\ \cite{b14} showed that using executable code as the agent's action space (CodeAct) can improve success rates by up to 20\%. Broader benchmarks such as AgentBench \cite{b23} and TheAgentCompany \cite{b24} evaluate LLM agents across multiple environments and real-world professional tasks, consistently showing that even the strongest models exhibit significant deficiencies in long-horizon reasoning. These efforts concentrate on making agents succeed more often; our work is complementary in that it tries to understand why they fail.
+
+\subsection{Agent Failure Analysis}
+
+Zhu~et~al.\ \cite{b5} proposed the AgentErrorTaxonomy and the original AgentDebug framework for analyzing failures in ALFWorld, GAIA, and WebShop. Their pipeline uses GPT-4 for both detection and corrective feedback, which delivers strong results but ties the cost to API pricing. It also relies on a single detection channel, so there is no built-in way to gauge what it overlooks. Cemri~et~al.\ \cite{b6} introduced MAST, a 14-category failure taxonomy derived from 150+ multi-agent traces. Winston~\cite{b7} proposed a taxonomy for tool-augmented LLM failures. Islam~et~al.\ \cite{b15} analyzed 1,187 bug reports across LLM agent frameworks, providing a complementary community-sourced view of failure modes.
+
+Our work differs in four ways: (1) we target the software engineering domain specifically, with code-aware error types; (2) we run two channels in parallel so we can compare what each one finds; (3) all inference runs locally, so the pipeline can scale without incurring per-call API fees; and (4) we quantify the module-level asymmetry inherent in pattern-only approaches.
+
+\subsection{LLM-Based Code Debugging}
+
+Historically, debugging has relied on static analysis, dynamic test suites, and symbolic execution to locate faults. Li~et~al.\ \cite{b19} showed that integrating LLMs with static analysis can improve practical bug detection, while Xia~et~al.\ \cite{b21} and Zhang~et~al.\ \cite{b20} surveyed the rapidly growing use of LLMs for automated program repair. Tambon~et~al.\ \cite{b25} catalogued 10 distinctive bug patterns in LLM-generated code, including hallucinated objects and missing corner cases. Chen~et~al.\ \cite{b8} explored whether LLMs can self-debug the code they produce; however, that work focuses on bugs in generated snippets, not on the higher-level cognitive and behavioral mistakes agents make while working through a task. More recently, Xia~et~al.\ \cite{b18} proposed Agentless, showing that some SE tasks can be solved without agentic scaffolding at all. Our approach sits between these two worlds: deterministic pattern matching handles the syntactic side, and an LLM handles the semantic side.
+
+\subsection{LLM Trustworthiness and Hallucination}
+
+A central concern in using an LLM as a detection channel is that it may hallucinate errors. Huang~et~al.\ \cite{b17} provide a comprehensive taxonomy of LLM hallucination types, and Huang~et~al.\ \cite{b22} benchmark trustworthiness across multiple dimensions. Our work encounters this challenge directly: the LLM channel produces roughly 8$\times$ more detections than regex, a fraction of which are false positives (see Section~\ref{sec:discussion}).
+
+\subsection{Counterfactual Reasoning in AI}
+
+Counterfactual reasoning, which asks ``what would have happened if X were different?'', has been used to improve AI interpretability \cite{b9}. We adopt it in Phase~2 to distinguish root causes from downstream symptoms: the error whose removal would most plausibly have changed the trajectory outcome is flagged as the critical one.
+
+
+% ============================================================
+% III. AGENT ERROR TAXONOMY
+% ============================================================
+\section{AgentErrorTaxonomy for Code Domain}
+\label{sec:taxonomy}
+
+We build on the taxonomy of Zhu~et~al.\ \cite{b5}, adapting it to software engineering with 20 error types spread across 5 cognitive modules (19 predefined plus \texttt{wrong\_file\_edit}, an emergent type surfaced by the LLM channel during analysis). Table~\ref{tab:taxonomy} lists every type together with a brief description and an empirical frequency label drawn from the 300-trajectory analysis. Types marked with $\dagger$ were not part of the original design but were added after the LLM channel consistently identified them.
+
+\begin{table*}[ht!]
+\caption{Extended AgentErrorTaxonomy for Software Engineering Domain: Classification of LLM Agent Errors Across Five Cognitive Modules. Frequency annotations come from dual-channel analysis of 300 trajectories.}
+\label{tab:taxonomy}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\textwidth}{|p{0.09\textwidth}|p{0.24\textwidth}|p{0.07\textwidth}|X|}
+\hline
+\textbf{Module} & \textbf{Error Type} & \textbf{Freq.} & \textbf{Description} \\
+\hline
+
+\multirow{5}{*}{\textbf{Memory}}
+    & \texttt{dependency\_\allowbreak{}omission}       & High   & Forgetting required imports, packages, or dependencies needed for code execution \\
+\cline{2-4}
+    & \texttt{file\_location\_\allowbreak{}forgetting} & Medium & Losing track of file paths or directory locations within the repository \\
+\cline{2-4}
+    & \texttt{over\_\allowbreak{}simplification}       & Low    & Incorrectly simplifying complex requirements, missing edge cases from memory \\
+\cline{2-4}
+    & \texttt{hallucination}              & Medium & Inventing non-existent code, files, functions, or API endpoints \\
+\cline{2-4}
+    & \texttt{retrieval\_\allowbreak{}failure}          & Medium    & Failing to retrieve relevant context from prior steps or codebase exploration \\
+\hline
+
+\multirow{4}{*}{\textbf{Reflection}}
+    & \texttt{progress\_\allowbreak{}misjudge}          & High    & Misjudging task completion status or overall progress toward the solution \\
+\cline{2-4}
+    & \texttt{outcome\_\allowbreak{}misinterpretation}  & Medium & Misreading error messages, test output, or execution results \\
+\cline{2-4}
+    & \texttt{error\_dismissal}            & Medium   & Ignoring or downplaying critical error signals from the environment \\
+\cline{2-4}
+    & \texttt{repetition\_\allowbreak{}blindness}       & Low & Failing to notice repeated identical failed attempts at the same fix \\
+\hline
+
+\multirow{4}{*}{\textbf{Planning}}
+    & \texttt{constraint\_\allowbreak{}ignorance}       & Low    & Violating explicit task constraints or codebase conventions \\
+\cline{2-4}
+    & \texttt{impossible\_\allowbreak{}action}          & Low    & Planning actions that cannot succeed given the current state of the environment \\
+\cline{2-4}
+    & \texttt{api\_\allowbreak{}hallucination}          & Medium & Invoking non-existent APIs, methods, or class attributes \\
+\cline{2-4}
+    & \texttt{scope\_violation}            & High & Modifying code beyond the intended scope of the requested changes \\
+\hline
+
+\multirow{4}{*}{\textbf{Action}}
+    & \texttt{syntax\_error}               & High & Python syntax violations in generated code (SyntaxError, invalid syntax) \\
+\cline{2-4}
+    & \texttt{indentation\_\allowbreak{}error}          & High & Incorrect whitespace or indentation in Python code (IndentationError) \\
+\cline{2-4}
+    & \texttt{parameter\_error}            & Medium & Wrong function arguments, types, keyword arguments, or parameter counts \\
+\cline{2-4}
+    & \texttt{wrong\_file\_edit}$^\dagger$ & High & Applying a correct patch to the wrong file or editing an unrelated file \\
+\hline
+
+\multirow{3}{*}{\textbf{System}}
+    & \texttt{tool\_execution\_\allowbreak{}error}      & Low    & Command or tool execution failures (subprocess errors, git failures) \\
+\cline{2-4}
+    & \texttt{environment\_\allowbreak{}error}          & Low    & Setup, configuration, or environment issues (missing packages, wrong Python version) \\
+\cline{2-4}
+    & \texttt{test\_timeout}               & Medium & Test execution exceeding time limits during validation \\
+\hline
+\end{tabularx}
+\end{table*}
+
+\subsection{Design Rationale}
+
+The five modules mirror the cognitive loop of a ReAct-style agent \cite{b2}: the agent recalls context (Memory), evaluates where it stands (Reflection), decides what to do next (Planning), carries out an action (Action), and receives feedback from the environment (System). Decomposing errors along this pipeline makes it possible to pinpoint exactly where reasoning breaks down.
+
+Three adaptations were necessary for the code domain: (1) we added error types that do not appear in the original taxonomy, such as \texttt{syntax\_error} and \texttt{indentation\_\allowbreak{}error}, because ALFWorld and WebShop agents never write Python; (2) we mapped existing types to their software engineering manifestations; \texttt{dependency\_\allowbreak{}omission}, for instance, corresponds to \texttt{Import\-Error} and \texttt{Module\-Not\-Found\-Error} in practice; and (3) we assigned frequency labels on the basis of the dual-channel results, so the taxonomy reflects observed data rather than theoretical expectations.
+
+% ============================================================
+% IV. METHODOLOGY
+% ============================================================
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Problem Formulation}
+
+Let $T = \{s_1, s_2, \ldots, s_n\}$ be an agent trajectory of $n$ steps, where each step $s_i$ pairs an observation $o_i$ (environment feedback) with an action $a_i$ (agent output). Our goals are:
+
+\begin{enumerate}
+    \item \textbf{Detect} errors through two independent channels, a regex channel $E^R$ and an LLM channel $E^L$, characterizing each error by its cognitive module, taxonomy type, and step location.
+    \item \textbf{Compare} the channels by computing, for every step--module pair, whether both detected an error, neither did, or only one of them did.
+    \item \textbf{Identify} the root-cause error $e^* = \arg\max_{e \in E^R \cup E^L} \text{impact}(e)$ via counterfactual reasoning.
+\end{enumerate}
+
+Fig.~\ref{fig:architecture} shows the complete pipeline.
+
+\begin{figure*}[ht!]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/agent_debug_architecture.png}
+\caption{The AgentDebug pipeline. Phase~1 passes every step through two independent channels: Channel~A (95 regex patterns) and Channel~B (local LLM). Phase~2 applies counterfactual reasoning with three-layer validation to identify the root-cause error.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsection{Phase 1: Dual-Channel Fine-Grained Detection}
+
+Both channels process every step independently; neither has access to the other's output.
+
+\subsubsection{Channel A: Pattern-Based (Regex) Detection}
+
+The regex channel draws on a hand-curated library of 95 regular expressions, each one written to match a particular kind of syntactic footprint. Some look for \texttt{Indentation\-Error} tracebacks, others for \texttt{Module\-Not\-Found\-Error} messages, and a few catch repeated failed commands. At every step we run the full set of patterns against the observation text and the action text. Whenever a pattern matches we record an error with confidence~1.0, so the channel is entirely deterministic. Table~\ref{tab:patterns} gives a module-by-module breakdown of the library.
+
+\begin{table*}[ht!]
+\caption{Pattern Library: Distribution and Representative Detection Patterns by Cognitive Module}
+\label{tab:patterns}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\textwidth}{|p{0.10\textwidth}|p{0.04\textwidth}|p{0.20\textwidth}|X|}
+\hline
+\textbf{Module} & \textbf{\#} & \textbf{Target Error Types} & \textbf{Representative Patterns} \\
+\hline
+
+\textbf{Memory} & 18 &
+\texttt{dependency\_\allowbreak{}omission}, \texttt{hallucination}, \texttt{retrieval\_\allowbreak{}failure} &
+\texttt{ImportError:.*}, \texttt{Module\-Not\-Found\-Error:.*}, \texttt{cannot import name}, \texttt{No module named}, \texttt{package.*not found} \\
+\hline
+
+\textbf{Reflection} & 15 &
+\texttt{error\_\allowbreak{}dismissal}, \texttt{repetition\_\allowbreak{}blindness}, \texttt{outcome\_\allowbreak{}misinterpretation} &
+\texttt{already tried.*same}, \texttt{ignoring.*error}, \texttt{test.*pass} (when tests actually fail) \\
+\hline
+
+\textbf{Planning} & 22 &
+\texttt{api\_\allowbreak{}hallucination}, \texttt{scope\_\allowbreak{}violation}, \texttt{constraint\_\allowbreak{}ignorance} &
+\texttt{Attribute\-Error:.*has no attribute}, \texttt{Name\-Error:.*is not defined}, \texttt{calling.*non-existent} \\
+\hline
+
+\textbf{Action} & 28 &
+\texttt{syntax\_\allowbreak{}error}, \texttt{indentation\_\allowbreak{}error}, \texttt{parameter\_\allowbreak{}error} &
+\texttt{SyntaxError:}, \texttt{Indentation\-Error:}, \texttt{TabError:}, \texttt{invalid syntax}, \texttt{unexpected EOF}, \texttt{TypeError:.*argument} \\
+\hline
+
+\textbf{System} & 12 &
+\texttt{tool\_\allowbreak{}execution\_\allowbreak{}error}, \texttt{environment\_\allowbreak{}error}, \texttt{test\_\allowbreak{}timeout} &
+\texttt{Timeout\-Error:}, \texttt{subprocess.*error}, \texttt{TIMEOUT}, \texttt{Command.*failed} \\
+\hline
+
+\multicolumn{2}{|l|}{\textbf{Total: 95}} & \multicolumn{2}{l|}{Covering 15 of the 20 error types across 5 modules} \\
+\hline
+\end{tabularx}
+\end{table*}
+
+\subsubsection{Channel B: LLM-Based Semantic Detection}
+
+The second channel sends the step context (observation, action, and the three most recent preceding steps) to Qwen2.5-Coder:7B running locally via Ollama. The model classifies errors across all five modules at once. Because it reads the actual meaning of the code rather than scanning for string patterns, it can spot problems that leave no syntactic trace: editing the wrong file, drifting out of scope, or misinterpreting a test result.
+
+\subsubsection{Agreement Computation}
+
+For each step $s_i$ and module $m \in \mathcal{M}$ (where $\mathcal{M}$ = \{memory, reflection, planning, action, system\}), let $R = E^R(s_i, m)$ and $L = E^L(s_i, m)$ denote the regex and LLM error sets respectively. The agreement label is:
+
+\begin{equation}
+\text{agree}(s_i, m) \!=\! \begin{cases}
+\texttt{both\_err} & R \!\neq\! \emptyset \,\wedge\, L \!\neq\! \emptyset \\
+\texttt{both\_cln} & R \!=\! \emptyset \,\wedge\, L \!=\! \emptyset \\
+\texttt{rgx\_only} & R \!\neq\! \emptyset \,\wedge\, L \!=\! \emptyset \\
+\texttt{llm\_only} & R \!=\! \emptyset \,\wedge\, L \!\neq\! \emptyset
+\end{cases}
+\end{equation}
+
+The overall agreement rate is:
+\begin{equation}
+\text{Agree} = \frac{N_{\textit{both\_err}} + N_{\textit{both\_cln}}}{N_{\textit{total}}}
+\end{equation}
+
+\subsubsection{End-to-End Pipeline}
+
+Algorithm~\ref{alg:pipeline} summarizes the full AgentDebug pipeline.
+
+\begin{algorithm}[h!]
+\caption{AgentDebug Dual-Channel Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Trajectory $T = \{s_1, \ldots, s_n\}$
+\ENSURE Root-cause error $e^*$, per-step agreement labels
+\STATE $\mathcal{M} \leftarrow \{\text{Mem, Ref, Plan, Act, Sys}\}$
+\STATE $E^R \leftarrow \emptyset$;\ $E^L \leftarrow \emptyset$
+\FOR{each step $s_i \in T$}
+    \STATE \COMMENT{Channel A: Regex (deterministic)}
+    \FOR{each pattern $p$ in 95-pattern library}
+        \IF{$p$ matches $s_i$.\textit{observation} or $s_i$.\textit{action}}
+            \STATE $E^R \leftarrow E^R \cup \{(i, \text{module}(p), \text{type}(p))\}$
+        \ENDIF
+    \ENDFOR
+    \STATE \COMMENT{Channel B: LLM (one call per step)}
+    \STATE $\textit{resp} \leftarrow \text{LLM}(s_i,\ s_{i-3:i-1})$ \COMMENT{3-step context}
+    \FOR{each $m \in \mathcal{M}$}
+        \IF{$\textit{resp}$ reports error for $m$}
+            \STATE $E^L \leftarrow E^L \cup \{(i, m, \textit{resp}.\text{type}(m))\}$
+        \ENDIF
+    \ENDFOR
+    \STATE \COMMENT{Compute agreement per module}
+    \FOR{each $m \in \mathcal{M}$}
+        \STATE $\text{agree}(s_i, m) \leftarrow \text{label}(E^R, E^L, i, m)$ \COMMENT{Eq.~1}
+    \ENDFOR
+\ENDFOR
+\STATE \COMMENT{Phase 2: Root-cause (one LLM call)}
+\STATE $e^* \!\leftarrow\! \text{LLM\_CF}(E^R \!\cup\! E^L, T)$
+\STATE $e^* \!\leftarrow\! \text{validate\_3layer}(e^*)$
+\RETURN $e^*$, $\{\text{agree}(s_i, m)\}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Phase 2: LLM-Powered Critical Error Identification}
+
+Once Phase~1 has produced error lists from both channels for a trajectory, Phase~2 takes the combined set and narrows it down to the single most consequential error.
+
+\subsubsection{Counterfactual Reasoning}
+
+The local LLM examines each detected error and asks: ``If this error had not occurred, would the agent likely have finished the task?'' Whichever error scores highest on this counterfactual test is labeled the root cause.
+
+\needspace{12\baselineskip}
+\subsubsection{Three-Layer Validation}
+
+LLM output is not always well-formed, so we enforce taxonomy compliance through three layers:
+
+\begin{enumerate}
+    \item \textbf{Prompt engineering:} The prompt spells out every valid module and type, along with formatting rules and a couple of worked examples. In practice, this step alone produces taxonomy-compliant output for roughly 94\% of Phase~2 calls.
+    \item \textbf{Post-parsing validation:} A programmatic check verifies that the returned module and type are in the taxonomy; minor deviations (e.g.\ casing, extra whitespace) are corrected automatically. This catches roughly 80\% of the violations that slip past Layer~1.
+    \item \textbf{Fallback correction:} Any remaining invalid value is mapped to its closest valid entry by string similarity.
+\end{enumerate}
+
+After all three layers, 12 of the 293 Phase~2 outputs (4.1\%) still carried labels outside the formal taxonomy (\texttt{format\_error}, \texttt{logic\_error}). We retain these as-is rather than force-mapping them, since they describe recognizable error behaviors even if our taxonomy does not include them.
+
+\subsubsection{Local LLM Configuration}
+
+All inference uses Ollama \cite{b11} with Qwen2.5-Coder:7B \cite{b12} (4.7\,GB quantized), temperature set to 0.0 for reproducibility. No API keys are needed and no data leaves the machine.
+
+
+% ============================================================
+% V. EXPERIMENTAL SETUP
+% ============================================================
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\subsection{Dataset}
+
+Our evaluation uses 300 agent trajectories drawn from the \texttt{nebius/SWE-agent-trajectories} collection on HuggingFace \cite{b10}. We selected the first 300 trajectories in alphabetical order by repository name, with no filtering by outcome or difficulty. Each trajectory records an agent's complete attempt at resolving a real GitHub issue: the task description, every observation--action pair, and the final success or failure verdict. Of the 300 trajectories, 36 (12.0\%) were resolved successfully and 264 (88.0\%) failed, consistent with the low resolution rates typically observed on SWE-bench for autonomous agents. The trajectories were generated by SWE-agent \cite{b3} running LLaMA models. Table~\ref{tab:dataset} summarizes the key numbers.
+
+\begin{table}[h!]
+\caption{Dataset Statistics}
+\label{tab:dataset}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|}
+\hline
+\textbf{Statistic} & \textbf{Value} \\
+\hline
+Total trajectories analyzed       & 300 \\
+\hline
+Resolved (passed)                & 36 (12.0\%) \\
+\hline
+Failed                           & 264 (88.0\%) \\
+\hline
+Total steps analyzed              & 8,524 \\
+\hline
+Average steps per trajectory      & 28.4 \\
+\hline
+Total module-level comparisons    & 42,620 \\
+\hline
+Regex errors detected             & 1,662 \\
+\hline
+LLM errors detected               & 13,616 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsection{Dual-Channel Processing}
+
+Each trajectory passes through both channels independently. A trajectory with $n$ steps yields $5n$ module-level comparisons (one per module per step). Across all 300 trajectories this adds up to 42,620 comparisons, giving us a substantial statistical base for the agreement analysis.
+
+We split the 300 trajectories into six batches of 50 and ran them over the span of about a week. Batch runtimes varied quite a bit, from roughly 40 minutes for the shortest to around 8 hours for the longest, mostly depending on how many steps the trajectories had and what else was running on the machine at the time.
+
+\subsection{Computing Environment}
+
+Everything ran on a regular Windows~11 laptop with 16\,GB of RAM; the GPU handled part of the workload but not all of it, since the model did not fit entirely in VRAM. Ollama served Qwen2.5-Coder:7B locally throughout. Adding up the LLM wall-clock time across all 300 trajectories gives roughly 70.8 hours, which works out to about 14.2 minutes per trajectory on average. The Phase~1 LLM channel made one call per step (8,524 calls) and Phase~2 made one call per trajectory (293 calls), for a total of roughly 8,800 LLM calls; 23 of those hit the timeout limit, putting the timeout rate under 0.3\%.
+
+
+% ============================================================
+% VI. RESULTS
+% ============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{RQ1: Error Distribution Across Cognitive Modules}
+
+Table~\ref{tab:overall} compares the raw detection numbers for both channels.
+
+\begin{table}[h!]
+\caption{Overall Detection Performance by Channel}
+\label{tab:overall}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|}
+\hline
+\textbf{Metric} & \textbf{Regex} & \textbf{LLM} \\
+\hline
+Total errors detected           & 1,662     & 13,616 \\
+\hline
+Avg.\ errors per trajectory     & 5.54      & 45.39 \\
+\hline
+Avg.\ errors per step           & 0.195     & 1.597 \\
+\hline
+Distinct error types observed   & 9         & 44 \\
+\hline
+\end{tabularx}
+\end{table}
+
+The gap is notable: the LLM channel reports 8.2$\times$ as many errors as our 95-pattern regex library. A richer set of patterns could narrow this ratio somewhat, but many of the errors the LLM flags, such as editing the wrong file, losing track of scope, or misjudging progress, are semantic in nature and would be difficult for any pattern-based approach to capture.
+
+\subsubsection{Module Distribution Comparison}
+
+Table~\ref{tab:module_dist} and Fig.~\ref{fig:error_distribution} break the numbers down by cognitive module.
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\columnwidth]{figures/error_distribution_code.png}
+\caption{How errors break down across cognitive modules in each channel. Action errors account for 53.1\% on the regex side but only 40.1\% on the LLM side, while Reflection (23.8\%) and Planning (22.6\%) pick up a much larger share in the LLM channel.}
+\label{fig:error_distribution}
+\end{figure}
+
+\begin{table}[h!]
+\caption{Error Distribution by Cognitive Module: Regex vs.\ LLM Channel}
+\label{tab:module_dist}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|r|r|}
+\hline
+\textbf{Module} & \textbf{Regex} & \textbf{Regex \%} & \textbf{LLM} & \textbf{LLM \%} \\
+\hline
+Action     & 883 & 53.1 & 5,458 & 40.1 \\
+\hline
+Memory     & 297 & 17.9 & 1,673 & 12.3 \\
+\hline
+Planning   & 183 & 11.0 & 3,084 & 22.6 \\
+\hline
+Reflection & 145 &  8.7 & 3,243 & 23.8 \\
+\hline
+System     & 154 &  9.3 &   158 &  1.2 \\
+\hline
+\textbf{Total} & \textbf{1,662} & \textbf{100} & \textbf{13,616} & \textbf{100} \\
+\hline
+\end{tabularx}
+\end{table}
+
+The two channels paint very different pictures. According to the regex channel, more than half of all errors live in the Action module, and the three cognitive modules (Memory, Reflection, Planning) account for only 37.6\%. The LLM channel tells another story: cognitive errors make up 58.7\% of the total, with Reflection (23.8\%) and Planning (22.6\%) each approaching or exceeding Action (40.1\%). We refer to this discrepancy as a \textit{module-level asymmetry}: pattern matching, by its nature, is better at catching errors that leave a syntactic trace (Action, System) and weaker at spotting reasoning-level mistakes (Planning, Reflection, Memory). The takeaway is not that one channel is right and the other wrong, but that each channel highlights a different slice of the failure landscape; any study relying solely on pattern matching will likely under-represent cognitive errors relative to syntactic ones.
+
+
+\subsection{RQ2: Dual-Channel Agreement Analysis}
+
+Table~\ref{tab:agreement} presents the agreement breakdown across all 42,620 module-level comparisons.
+
+\begin{table}[h!]
+\caption{Dual-Channel Agreement Analysis (42,620 Module-Level Comparisons)}
+\label{tab:agreement}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|}
+\hline
+\textbf{Agreement Category} & \textbf{Count} & \textbf{\%} \\
+\hline
+\texttt{both\_clean} (neither detects error) & 28,393 & 66.6 \\
+\hline
+\texttt{llm\_only} (LLM detects, regex misses) & 12,565 & 29.5 \\
+\hline
+\texttt{both\_error} (both detect error)      & 1,051 &  2.5 \\
+\hline
+\texttt{regex\_only} (regex detects, LLM misses) & 611 &  1.4 \\
+\hline
+\hline
+\textbf{Overall agreement rate}               & \multicolumn{2}{r|}{\textbf{69.1\%}} \\
+\hline
+\textbf{Error type agreement (when both detect)} & \multicolumn{2}{r|}{\textbf{0.0\%}} \\
+\hline
+\end{tabularx}
+\end{table}
+
+\subsubsection{What the Agreement Rate Means}
+
+About two-thirds of the time the channels agree: 66.6\% of comparisons fall into \texttt{both\_clean} and another 2.5\% into \texttt{both\_error}. The disagreements, however, are lopsided. Nearly 30\% of all comparisons are \texttt{llm\_only}, cases where the LLM spots a problem that the regex engine misses entirely, while only 1.4\% go the other way. In practical terms, for every module-step pair where the regex channel catches something the LLM does not, there are roughly twenty where the opposite happens.
+
+\subsubsection{Zero Type-Level Agreement}
+
+A notable finding is that whenever both channels flag the same step-module pair (1,051 cases), they \textit{never} assign the same error type. This partly reflects the different type vocabularies (9 regex types vs.\ 44 LLM types), but even among the types that both channels can assign, agreement is absent. The regex channel will report, say, \texttt{indentation\_\allowbreak{}error}, while the LLM channel labels the same module \texttt{scope\_\allowbreak{}violation} or \texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit}. In a sense, both labels are right: the regex is picking up on the visible symptom while the LLM is pointing at the deeper cause. We think this is actually good news, because it means the two channels are genuinely covering different ground rather than duplicating each other's work.
+
+\subsubsection{Statistical Significance}
+
+To confirm that these patterns are not artifacts of sample size, we ran a battery of statistical tests. Table~\ref{tab:stats} summarizes the key results.
+
+\begin{table}[h!]
+\caption{Statistical Tests for Dual-Channel Detection ($N = 42{,}620$)}
+\label{tab:stats}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|}
+\hline
+\textbf{Test / Metric} & \textbf{Value} & \textbf{95\% CI} \\
+\hline
+Overall agreement rate  & 69.1\% & [68.6, 69.5]\% \\
+\hline
+Detection multiplier    & 8.19$\times$ & [5.96, 10.67]$\times$ \\
+\hline
+$\chi^2$ (independence) & 779.0  & $p < 10^{-16}$ \\
+\hline
+Cram\'{e}r's $V$        & 0.135  & --- \\
+\hline
+Cohen's $h$             & 0.77   & --- \\
+\hline
+Odds ratio              & 3.89   & [3.51, 4.30] \\
+\hline
+McNemar's $\chi^2$      & 10{,}844 & $p < 10^{-16}$ \\
+\hline
+\end{tabularx}
+\end{table}
+
+A $\chi^2$ test of independence on the $2\times2$ table (regex detects / does not $\times$ LLM detects / does not) yields $\chi^2 = 779.0$ ($p < 10^{-16}$), rejecting the null of independence. However, Cram\'{e}r's $V = 0.135$ indicates only a \emph{small} practical association: the statistical significance is driven primarily by the large $N$. Cohen's $h = 0.77$ (medium-to-large) confirms that the difference in detection rates is substantively meaningful. McNemar's test on the discordant pairs (12{,}565 LLM-only vs.\ 611 regex-only; ratio 20.6:1) confirms the marginal asymmetry ($\chi^2 = 10{,}844$, $p < 10^{-16}$). The odds ratio of 3.89 [3.51, 4.30] means that when regex does flag a module, the LLM is nearly four times more likely to flag it as well, suggesting both channels respond to genuinely error-prone steps. The batch-level 95\% confidence interval for the detection multiplier is [5.96$\times$, 10.67$\times$], confirming the LLM's broader coverage is robust across subsamples.
+
+\subsubsection{Most Frequent LLM-Detected Error Types}
+
+Table~\ref{tab:llm_types} lists the eight most frequent error types in the LLM channel. Most of these have no regex counterpart; a few (\texttt{scope\_violation}, \texttt{hallucination}) overlap with regex targets but are detected far more often by the LLM.
+
+\begin{table}[h!]
+\caption{Most Frequent LLM-Detected Error Types}
+\label{tab:llm_types}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|}
+\hline
+\textbf{Error Type} & \textbf{Count} & \textbf{LLM \%} \\
+\hline
+\texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit}         & 3,061 & 22.5 \\
+\hline
+\texttt{scope\_\allowbreak{}violation}          & 2,327 & 17.1 \\
+\hline
+\texttt{progress\_\allowbreak{}misjudge}        & 1,400 & 10.3 \\
+\hline
+\texttt{retrieval\_\allowbreak{}failure}        &   767 &  5.6 \\
+\hline
+\texttt{outcome\_\allowbreak{}misinterpretation} & 684 &  5.0 \\
+\hline
+\texttt{file\_\allowbreak{}location\_\allowbreak{}forgetting} & 506 &  3.7 \\
+\hline
+\texttt{hallucination}            &   249 &  1.8 \\
+\hline
+\texttt{impossible\_\allowbreak{}action}        &   250 &  1.8 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\texttt{wrong\_file\_\allowbreak{}edit} alone accounts for over one in five LLM-detected errors. An agent that opens the correct file, understands the bug, writes a valid patch, but applies it to the wrong file, will never trigger a regex pattern because the code itself is syntactically fine. Taken together, these semantically-detected types make up 67.9\% of the LLM channel's output, underscoring how much a regex-only approach leaves on the table.
+
+It is worth noting that the Phase~1 LLM channel is not constrained to the 20-type taxonomy; across all trajectories it produced 44 distinct type labels. The most prominent emergent type, \texttt{wrong\_file\_\allowbreak{}edit}, was frequent and specific enough that we added it to the taxonomy (Table~\ref{tab:taxonomy}). Phase~2, by contrast, uses three-layer validation to map its output onto taxonomy entries, though a small number of labels still fall outside the taxonomy (see Section~\ref{sec:discussion}).
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\columnwidth]{figures/top_error_types.png}
+\caption{Most frequent error types in each channel. Regex is dominated by syntactic errors (\texttt{syntax\_\allowbreak{}error}, \texttt{indentation\_\allowbreak{}error}), while the LLM surfaces semantic errors (\texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit}, \texttt{scope\_\allowbreak{}violation}) that leave no pattern-matchable trace.}
+\label{fig:top_error_types}
+\end{figure}
+
+
+\subsection{RQ3: Critical Error Analysis}
+
+Phase~2 used counterfactual reasoning to identify the root-cause error for each trajectory. Table~\ref{tab:critical} shows how these root causes distribute across modules and types, aggregated from all six batches.
+
+\begin{table}[h!]
+\caption{Critical (Root-Cause) Errors Identified by Phase 2}
+\label{tab:critical}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|}
+\hline
+\multicolumn{3}{|l|}{\textbf{(a) Critical Errors by Module}} \\
+\hline
+\textbf{Module} & \textbf{Count} & \textbf{\%} \\
+\hline
+Action     & 170 & 58.0 \\
+\hline
+System     &  55 & 18.8 \\
+\hline
+Planning   &  39 & 13.3 \\
+\hline
+Reflection &  25 &  8.5 \\
+\hline
+Memory     &   4 &  1.4 \\
+\hline
+\textbf{Total} & \textbf{293} & \textbf{100} \\
+\hline
+\multicolumn{3}{|l|}{\textbf{(b) Top Critical Error Types}} \\
+\hline
+\textbf{Error Type} & \textbf{Count} & \textbf{\%} \\
+\hline
+\texttt{syntax\_\allowbreak{}error}          & 108 & 36.9 \\
+\hline
+\texttt{indentation\_\allowbreak{}error}     &  31 & 10.6 \\
+\hline
+\texttt{tool\_\allowbreak{}execution\_\allowbreak{}error} &  30 & 10.2 \\
+\hline
+\texttt{parameter\_\allowbreak{}error}       &  21 &  7.2 \\
+\hline
+\texttt{scope\_\allowbreak{}violation}       &  14 &  4.8 \\
+\hline
+\texttt{error\_\allowbreak{}dismissal}       &  14 &  4.8 \\
+\hline
+Other (9 types)                &  75 & 25.6 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\columnwidth]{figures/critical_errors_analysis.png}
+\caption{Distribution of critical (root-cause) errors across cognitive modules and error types. Action-module errors dominate root causes (58.0\%), with \texttt{syntax\_error} alone responsible for 36.9\% of trajectory failures.}
+\label{fig:critical_errors}
+\end{figure}
+
+Phase~2 produced a root cause for 293 of the 300 trajectories; the remaining 7 timed out or could not isolate a single dominant error. An interesting pattern emerges when we compare frequency with criticality. System errors make up only 9.3\% of all regex detections but 18.8\% of root causes, a 2.0$\times$ amplification, which means they punch well above their weight. Memory errors show the opposite: common in the regex channel (17.9\%) yet rarely the root cause (1.4\%). This \textit{frequency--criticality inversion} suggests that simply fixing the most frequently occurring errors may not be the most effective strategy; some rare errors are far more damaging than common ones.
+
+\subsubsection{Error--Outcome Correlation}
+
+Of the 300 trajectories, 36 (12.0\%) resolved the issue and 264 (88.0\%) failed. Comparing the two groups reveals that failing trajectories are roughly twice as long (mean 30.4 steps vs.\ 14.1) and accumulate more errors per trajectory in both channels (Table~\ref{tab:outcome}).
+
+\begin{table}[h!]
+\caption{Error Profiles: Resolved vs.\ Failed Trajectories}
+\label{tab:outcome}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|X|r|r|r|}
+\hline
+\textbf{Metric} & \textbf{Resolved} & \textbf{Failed} & \textbf{Ratio} \\
+\hline
+Mean steps            & 14.1  & 30.4  & 2.2$\times$ \\
+\hline
+Regex errors/traj.    & 2.7   & 5.9   & 2.2$\times$ \\
+\hline
+LLM errors/traj.      & 17.3  & 49.2  & 2.8$\times$ \\
+\hline
+Regex errors/step     & 0.175 & 0.184 & 1.1$\times$ \\
+\hline
+LLM errors/step       & 1.059 & 1.351 & 1.3$\times$ \\
+\hline
+\end{tabularx}
+\end{table}
+
+After normalizing by trajectory length, the per-step error rate difference shrinks considerably: regex shows almost no gap (1.06$\times$), while the LLM channel still shows a modest 1.28$\times$ elevation in failing trajectories. The most discriminative individual error type is \texttt{syntax\_\allowbreak{}error}, which occurs 8.8$\times$ more often per trajectory in failed runs than in resolved ones. Among LLM-detected types, \texttt{progress\_\allowbreak{}misjudge} (3.7$\times$), \texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit} (2.9$\times$), and \texttt{retrieval\_\allowbreak{}failure} (2.6$\times$) show the strongest association with failure.
+
+Two takeaways stand out. First, failure is not simply a matter of making more errors per step; rather, failing agents take more steps, each with a marginally higher error rate, compounding over a longer trajectory. Second, the LLM channel is more sensitive to the pass/fail distinction than regex (1.28$\times$ vs.\ 1.06$\times$ per step), suggesting that the semantic errors it detects are more predictive of outcome.
+
+
+\subsection{Regex-Channel Error Type Breakdown}
+
+Table~\ref{tab:error_types} lists the nine error types the regex channel detects, ranked by frequency.
+
+\begin{table}[h!]
+\caption{Regex-Channel Error Types by Frequency}
+\label{tab:error_types}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\columnwidth}{|c|X|X|r|r|}
+\hline
+\textbf{\#} & \textbf{Error Type} & \textbf{Module} & \textbf{Count} & \textbf{\%} \\
+\hline
+1 & \texttt{syntax\_\allowbreak{}error}         & Action     & 523 & 31.5 \\
+\hline
+2 & \texttt{dependency\_\allowbreak{}omission}  & Memory     & 297 & 17.9 \\
+\hline
+3 & \texttt{indentation\_\allowbreak{}error}    & Action     & 246 & 14.8 \\
+\hline
+4 & \texttt{test\_\allowbreak{}timeout}         & System     & 154 &  9.3 \\
+\hline
+5 & \texttt{parameter\_\allowbreak{}error}      & Action     & 114 &  6.9 \\
+\hline
+6 & \texttt{scope\_\allowbreak{}violation}      & Planning   &  94 &  5.7 \\
+\hline
+7 & \texttt{error\_\allowbreak{}dismissal}      & Reflection &  94 &  5.7 \\
+\hline
+8 & \texttt{api\_\allowbreak{}hallucination}    & Planning   &  89 &  5.4 \\
+\hline
+9 & \texttt{repetition\_\allowbreak{}blindness} & Reflection &  51 &  3.1 \\
+\hline
+\end{tabularx}
+\end{table}
+
+\texttt{syntax\_\allowbreak{}error} tops the list at 31.5\%, closely followed by \texttt{dependency\_\allowbreak{}omission} (17.9\%) and \texttt{indentation\_\allowbreak{}error} (14.8\%). Together, the Action-module types (\texttt{syntax\_\allowbreak{}error}, \texttt{indentation\_\allowbreak{}error}, \texttt{parameter\_\allowbreak{}error}) account for 53.1\% of all regex detections, consistent with the module-level numbers in Table~\ref{tab:module_dist}. These are the low-hanging fruit: straightforward to fix with AST validation or formatting tools, and they would cut the regex error count roughly in half.
+
+Notably, 6 of the 15 types targeted by regex patterns produced zero detections across all 300 trajectories: \texttt{constraint\_\allowbreak{}ignorance}, \texttt{environment\_\allowbreak{}error}, \texttt{hallucination}, \texttt{outcome\_\allowbreak{}misinterpretation}, \texttt{retrieval\_\allowbreak{}failure}, and \texttt{tool\_\allowbreak{}execution\_\allowbreak{}error}. This does not mean these errors are absent; the LLM channel flags all six. Rather, these error types tend to manifest semantically rather than through recognizable string patterns, illustrating the inherent ceiling of regex-based detection for reasoning-level failures.
+
+
+
+% ============================================================
+% VII. COMPARISON WITH EXISTING APPROACHES
+% ============================================================
+\section{Comparison with Existing Approaches}
+\label{sec:comparison}
+
+Table~\ref{tab:comparison} places AgentDebug alongside prior error detection methods.
+
+\begin{table*}[ht!]
+\caption{Comparison of Error Detection Approaches for LLM Agents}
+\label{tab:comparison}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\textwidth}{|X|X|X|X|X|X|}
+\hline
+\textbf{Approach} & \textbf{Cost} & \textbf{Detection Method} & \textbf{Channels} & \textbf{Domain} & \textbf{Key Limitation} \\
+\hline
+
+Human Annotation \cite{b5} &
+\$500+ (10 annotators) &
+Manual &
+Single &
+Any &
+Does not scale; $\kappa = 0.55$ \\
+\hline
+
+AgentErrorBench \cite{b5} (GPT-4) &
+\$150--200 per 1K traj. &
+API-based LLM &
+Single &
+ALFWorld, GAIA, WebShop &
+API-dependent; no code domain \\
+\hline
+
+MAST \cite{b6} &
+Not reported &
+Manual + LLM &
+Single &
+Multi-agent systems &
+Limited to multi-agent failures \\
+\hline
+
+\textbf{AgentDebug (Ours)} &
+\textbf{\$0.00 (local LLM)} &
+\textbf{Regex + Local LLM} &
+\textbf{Dual} &
+\textbf{SWE-bench (Code)} &
+\textbf{Code domain only} \\
+\hline
+\end{tabularx}
+\end{table*}
+
+The distinguishing feature of AgentDebug is that it runs two channels rather than one, which means it can measure its own blind spots rather than simply assuming comprehensive coverage. Running inference locally also makes it straightforward for any group to replicate or extend the experiments without needing API access.
+
+
+% ============================================================
+% VIII. ACTIONABLE INSIGHTS
+% ============================================================
+\section{RQ4: Actionable Insights for Agent Improvement}
+\label{sec:insights}
+
+The dual-channel data suggest four concrete interventions, each targeting a different slice of the error distribution.
+
+\subsection{Syntax Pre-Validation}
+
+\texttt{syntax\_\allowbreak{}error} (31.5\% of regex detections, 21.1\% of LLM detections) and \texttt{indentation\_\allowbreak{}error} (14.8\% regex, 0.8\% LLM) are the most mechanically fixable errors in the dataset. Running an AST parser and a whitespace linter on every code block before the agent submits it would catch nearly all of these. Given that Action errors also dominate the root-cause list (58.0\%), this single change could prevent a large share of outright trajectory failures.
+
+\subsection{Scope-Aware Editing}
+
+The LLM channel's two most common semantic errors are \texttt{wrong\_file\_\allowbreak{}edit} (22.5\%) and \texttt{scope\_\allowbreak{}violation} (17.1\%). Both stem from the agent modifying code it should not be touching. Restricting edits to files and functions that are explicitly relevant to the task, perhaps through a lightweight scope guard, would address nearly 40\% of all LLM-detected errors.
+
+\subsection{Persistent Context Memory}
+
+Both channels flag memory-related failures: \texttt{dependency\_\allowbreak{}omission} (17.9\% regex), \texttt{file\_\allowbreak{}location\_\allowbreak{}forgetting} (3.7\% LLM), \texttt{retrieval\_\allowbreak{}failure} (5.6\% LLM). These all come down to the agent losing track of information it encountered earlier. Maintaining a running context log (imports used, files visited, modifications made) would give the agent a reliable external memory to consult.
+
+\subsection{Reflection Quality Gates}
+
+The LLM channel reveals that agents frequently misjudge their own progress (\texttt{progress\_\allowbreak{}misjudge}, 10.3\%) or misread test output (\texttt{outcome\_\allowbreak{}mis\-inter\-pretation}, 5.0\%). Requiring the agent to explicitly verify that an error has been resolved before moving on, a simple ``did the test actually pass?'' check, would cut down on the cascading failures that result from premature confidence.
+
+
+% ============================================================
+% IX. DISCUSSION AND LIMITATIONS
+% ============================================================
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\subsection{What the Dual-Channel Design Tells Us}
+
+The 0\% type-level agreement is, on the surface, a surprising number, but it makes sense once you think about what each channel is actually looking at. When a regex pattern fires on an \texttt{Indentation\-\allowbreak{}Error} traceback and the LLM labels the same step as \texttt{scope\_\allowbreak{}violation}, both are correct; they are simply describing different layers of the failure. The regex sees the symptom; the LLM sees the cause. This layered view is something no single-channel system can provide.
+
+The 8.2$\times$ detection multiplier raises an obvious concern: is the LLM just hallucinating errors? To get a preliminary handle on this, we manually inspected a random sample of 100 LLM-detected errors drawn across all six batches. We classified each as \textit{valid} (the error clearly matches the step context), \textit{plausible} (the error could be real but the context is ambiguous), or \textit{invalid} (the LLM hallucinated an error that did not occur). The results vary sharply by error category: cognitive error types such as \texttt{retrieval\_\allowbreak{}failure}, \texttt{outcome\_\allowbreak{}misinterpretation}, and \texttt{progress\_\allowbreak{}misjudge} showed estimated precision (valid~+~plausible) in the 60--80\% range, while high-volume types like \texttt{wrong\_\allowbreak{}file\_\allowbreak{}edit} and \texttt{scope\_\allowbreak{}violation} had substantially lower precision, often because the LLM mislabeled normal exploration steps (reading files, running searches) as errors. The dominant false-positive pattern is ``exploration-as-error'': the LLM expects the agent to know exactly where to edit from the start and penalizes legitimate codebase exploration.
+
+Three additional signals support the LLM channel's credibility despite this noise. First, the 1,051 \texttt{both\_\allowbreak{}error} cases, where both channels independently flag the same module, are high-confidence detections. Second, the LLM channel's per-step error rate is 1.28$\times$ higher in failing trajectories than in resolved ones (vs.\ only 1.06$\times$ for regex), suggesting it tracks outcome-relevant signals. Third, the error types the LLM reports are specific and contextually grounded, not generic. That said, a larger-scale annotation study with multiple raters is needed to pin down false-positive rates per type, and we plan one for future work.
+
+\subsection{Module-Level Asymmetry}
+
+Our data show that pattern-based and LLM-based detection paint noticeably different pictures of agent failure. Regex over-represents Action and System errors (62.4\% combined) relative to cognitive errors (37.6\% vs.\ 58.7\% in the LLM channel). This asymmetry is expected: patterns fire on syntactic traces, while the LLM reads semantic context. Neither channel is ``ground truth''; however, the discrepancy suggests that studies relying on a single detection mechanism may see only one slice of the full failure landscape.
+
+\subsection{Limitations}
+
+\textbf{Domain scope.} The current taxonomy and regex patterns target Python-based SWE-bench trajectories; adapting them to other languages or non-coding agent tasks would require additional work.
+
+\textbf{Single agent framework.} Our evaluation uses trajectories from SWE-agent with LLaMA models. Running the pipeline on other agent architectures may yield different error distributions.
+
+\textbf{LLM model size.} All inference used Qwen2.5-Coder:7B. A larger model could improve semantic detection accuracy, though at the cost of higher resource requirements.
+
+
+% ============================================================
+% X. CONCLUSION AND FUTURE WORK
+% ============================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+We have presented AgentDebug, a dual-channel architecture for detecting and analyzing errors in LLM agents working on software engineering tasks. Across 300 SWE-bench trajectories (8,524 steps and 42,620 module-level comparisons), we arrive at six main findings:
+
+\begin{enumerate}
+    \item The regex channel catches 1,662 errors; the LLM channel catches 13,616. The 8.2$\times$ gap suggests that the bulk of agent failures are semantic rather than syntactic, though the true multiplier is likely lower once LLM false positives are accounted for.
+
+    \item The two channels agree on module state 69.1\% of the time, but they never agree on error type when both flag the same module. Syntactic detection and semantic detection are complementary, not redundant.
+
+    \item Regex patterns skew toward Action and System errors (62.4\% combined), while the LLM channel shows that cognitive errors (Planning, Reflection, Memory) actually make up the majority (58.7\%). This module-level asymmetry means that relying on patterns alone under-represents reasoning failures.
+
+    \item The most common LLM-detected error, \texttt{wrong\_file\_\allowbreak{}edit} (22.5\%), has no syntactic footprint and is unlikely to be captured by any pattern-based approach.
+
+    \item Some error types are rarer but far more damaging: System errors account for 9.3\% of regex detections yet 18.8\% of root causes, a 2.0$\times$ amplification that would be easy to overlook in a frequency-only analysis.
+
+    \item Failing trajectories are not simply noisier per step; rather, they run 2.2$\times$ longer with a marginally higher per-step error rate, suggesting that failure compounds over time. The LLM channel is more sensitive to the pass/fail distinction than regex (1.28$\times$ vs.\ 1.06$\times$ per step).
+\end{enumerate}
+
+\subsection{Future Directions}
+
+\begin{itemize}
+    \item \textbf{Scaled human validation.} Our 100-error spot-check provides initial precision estimates, but a full multi-rater annotation study (200+ errors per channel) is needed to establish per-type precision and recall with statistical confidence.
+    \item \textbf{Cross-model comparison.} Running the pipeline on trajectories from different agent models and scales would reveal how model capacity affects failure patterns.
+    \item \textbf{Real-time detection.} Integrating the regex channel into the agent loop for on-the-fly error prevention is a natural next step.
+    \item \textbf{Domain expansion.} Adapting the taxonomy and patterns to other languages and non-code agent tasks (web navigation, data analysis) would broaden the framework's applicability.
+\end{itemize}
+
+All code, data, and analysis scripts are publicly available to support further research on making LLM agents more reliable.
+
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\begin{thebibliography}{00}
+\normalsize
+
+\bibitem{b1} C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, and K. Narasimhan, ``SWE-bench: Can language models resolve real-world GitHub issues?'' in \textit{Proc. ICLR}, 2024.
+
+\bibitem{b2} S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, and Y. Cao, ``ReAct: Synergizing reasoning and acting in language models,'' in \textit{Proc. ICLR}, 2023.
+
+\bibitem{b3} J. Yang, C. E. Jimenez, A. Wettig, K. Lieret, S. Yao, K. Narasimhan, and O. Press, ``SWE-agent: Agent-computer interfaces enable automated software engineering,'' \textit{arXiv preprint arXiv:2405.15793}, 2024.
+
+\bibitem{b4} Y. Zhang, H. Ruan, Z. Fan, and A. Roychoudhury, ``AutoCodeRover: Autonomous program improvement,'' in \textit{Proc. ISSTA}, 2024.
+
+\bibitem{b5} K. Zhu, Z. Liu, B. Li, M. Tian, Y. Yang, J. Zhang, P. Han, Q. Xie, F. Cui, W. Zhang, X. Ma, X. Yu, G. Ramesh, J. Wu, Z. Liu, P. Lu, J. Zou, and J. You, ``Where LLM agents fail and how they can learn from failures,'' \textit{arXiv preprint arXiv:2509.25370}, 2025.
+
+\bibitem{b6} M. Cemri, M. Z. Pan, and S. Yang, ``Why do multi-agent LLM systems fail?'' \textit{arXiv preprint arXiv:2503.13657}, 2025.
+
+\bibitem{b7} C. Winston, ``A taxonomy of failures in tool-augmented LLMs,'' in \textit{Proc. AST}, 2025.
+
+\bibitem{b8} X. Chen, M. Lin, N. Sch\"{a}rli, and D. Zhou, ``Teaching large language models to self-debug,'' in \textit{Proc. ICLR}, 2024.
+
+\bibitem{b9} S. Verma, V. Boonsanong, M. Hoang, K. E. Hines, J. P. Dickerson, and C. Shah, ``Counterfactual explanations and algorithmic recourses for machine learning: A review,'' \textit{ACM Computing Surveys}, vol.~56, no.~12, pp.~1--42, 2024.
+
+\bibitem{b10} Nebius, ``SWE-agent trajectories dataset,'' HuggingFace, 2024. [Online]. Available: \url{https://huggingface.co/datasets/nebius/SWE-agent-tra\-jectories}
+
+\bibitem{b11} Ollama, ``Get up and running with large language models locally,'' 2024. [Online]. Available: \url{https://ollama.ai}
+
+\bibitem{b12} B. Hui, J. Yang, Z. Cui, J. Yang, D. Liu, L. Zhang, T. Liu, J. Zhang, B. Yu, K. Lu, and others, ``Qwen2.5-Coder technical report,'' \textit{arXiv preprint arXiv:2409.12186}, 2024.
+
+\bibitem{b13} X. Wang, B. Li, Y. Song, F. F. Xu, X. Tang, M. Zhuge, J. Pan, Y. Song, B. Li, and others, ``OpenHands: An open platform for AI software developers as generalist agents,'' in \textit{Proc. ICLR}, 2025. arXiv:2407.16741.
+
+\bibitem{b14} X. Wang, Y. Chen, L. Yuan, Y. Zhang, Y. Li, H. Peng, and H. Ji, ``Executable code actions elicit better LLM agents,'' in \textit{Proc. ICML}, 2024. arXiv:2402.01030.
+
+\bibitem{b15} N. Islam, R. S. Ayon, D. G. Thomas, S. Ahmed, and M. Wardat, ``When agents fail: A comprehensive study of bugs in LLM agents with automated labeling,'' \textit{arXiv preprint arXiv:2601.15232}, 2026.
+
+\bibitem{b16} R. Aleithan, H. Xue, M. M. Mohajer, E. Nnorom, G. Uddin, and S. Wang, ``SWE-bench+: Enhanced coding benchmark for LLMs,'' \textit{arXiv preprint arXiv:2410.06992}, 2024.
+
+\bibitem{b17} L. Huang, W. Yu, W. Ma, W. Zhong, Z. Feng, H. Wang, Q. Chen, W. Peng, X. Feng, B. Qin, and T. Liu, ``A survey on hallucination in large language models: Principles, taxonomy, challenges, and open questions,'' \textit{ACM Trans. Inf. Syst.}, 2024. arXiv:2311.05232.
+
+\bibitem{b18} C. S. Xia, Y. Deng, S. Dunn, and L. Zhang, ``Agentless: Demystifying LLM-based software engineering agents,'' in \textit{Proc. ACM SIGSOFT FSE}, 2025. arXiv:2407.01489.
+
+\bibitem{b19} H. Li, Y. Hao, Y. Zhai, and Z. Qian, ``Enhancing static analysis for practical bug detection: An LLM-integrated approach,'' \textit{Proc. ACM Program. Lang.}, vol.~8, OOPSLA1, 2024.
+
+\bibitem{b20} Q. Zhang, C. Fang, Y. Xie, Y. Ma, W. Sun, Y. Yang, and Z. Chen, ``A systematic literature review on large language models for automated program repair,'' \textit{arXiv preprint arXiv:2405.01466}, 2024.
+
+\bibitem{b21} C. S. Xia, Y. Wei, and L. Zhang, ``Automated program repair in the era of large pre-trained language models,'' in \textit{Proc. 45th IEEE/ACM ICSE}, 2023, pp.~1482--1494.
+
+\bibitem{b22} Y. Huang, L. Sun, H. Wang, S. Wu, Q. Zhang, Y. Li, C. Gao, Y. Huang, W. Lyu, Y. Zhang, and others, ``TrustLLM: Trustworthiness in large language models,'' in \textit{Proc. ICML}, 2024. arXiv:2401.05561.
+
+\bibitem{b23} X. Liu, H. Yu, H. Zhang, Y. Xu, X. Lei, H. Lai, Y. Gu, H. Ding, K. Men, K. Yang, S. Zhang, X. Deng, A. Zeng, Z. Du, C. Zhang, S. Shen, T. Zhang, Y. Su, H. Sun, M. Huang, Y. Dong, and J. Tang, ``AgentBench: Evaluating LLMs as agents,'' in \textit{Proc. ICLR}, 2024. arXiv:2308.03688.
+
+\bibitem{b24} F. F. Xu, Y. Song, B. Li, Y. Tang, K. Jain, M. Bao, Z. Z. Wang, X. Zhou, Z. Guo, M. Cao, and others, ``TheAgentCompany: Benchmarking LLM agents on consequential real world tasks,'' \textit{arXiv preprint arXiv:2412.14161}, 2024.
+
+\bibitem{b25} F. Tambon, A. Moradi~Dakhel, A. Nikanjam, F. Khomh, M. C. Desmarais, and G. Antoniol, ``Bugs in large language models generated code: An empirical study,'' \textit{Empir. Softw. Eng.}, vol.~30, art.~65, 2025. arXiv:2403.08937.
+
+\end{thebibliography}
+
+\end{document}
