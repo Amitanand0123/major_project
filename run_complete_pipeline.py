@@ -30,6 +30,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from detector.swebench_integration import SWEBenchLoader, create_sample_trajectory
 from detector.code_phase1_detector import CodePhase1Detector
 from detector.code_phase2_detector import CodePhase2Detector
+from detector.code_phase3_debugger import CodePhase3Debugger
+from detector.patch_verifier import DockerPatchVerifier
 from experiments.run_code_experiments import CodeExperimentRunner
 from analysis.cross_domain_analysis import CrossDomainAnalyzer, ResultsVisualizer
 
@@ -110,11 +112,43 @@ class MasterPipeline:
             print(f"  - Step: {critical['step_number']}")
             print(f"  - Module: {critical['module']}")
 
+        # Phase 3: Iterative debugging with Docker verification
+        phase3_results = None
+        if phase2_results.get('critical_error'):
+            print("\n[3.5/4] Running Phase 3 iterative debugging + Docker verification...")
+            verifier = None
+            try:
+                verifier = DockerPatchVerifier()
+                if verifier.is_available():
+                    print("  Docker patch verifier: ENABLED")
+                else:
+                    print("  Docker patch verifier: DISABLED")
+                    verifier = None
+            except Exception:
+                pass
+            phase3_debugger = CodePhase3Debugger(self.llm, verifier=verifier)
+            try:
+                phase3_results = await phase3_debugger.run_phase3(
+                    phase2_results, phase1_results, trajectory
+                )
+                if phase3_results:
+                    print(f"Phase 3 complete:")
+                    print(f"  - Iterations: {phase3_results['total_iterations']}")
+                    print(f"  - Simulated success: {phase3_results['final_success']}")
+                    print(f"  - Feedback quality: {phase3_results['final_feedback_quality']}")
+                    rv = phase3_results.get('real_verification')
+                    if rv and isinstance(rv, dict) and 'tests_passed' in rv:
+                        print(f"  - REAL tests passed: {rv['tests_passed']}")
+                        print(f"  - Simulated vs Real match: {phase3_results.get('simulated_vs_real_match')}")
+            except Exception as e:
+                print(f"  Phase 3 error: {e}")
+
         # Save results
         print("\n[4/4] Saving demo results...")
         demo_results = {
             'phase1': phase1_results,
             'phase2': phase2_results,
+            'phase3': phase3_results,
             'timestamp': datetime.now().isoformat()
         }
 

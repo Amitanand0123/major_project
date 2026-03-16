@@ -17,6 +17,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from detector.swebench_integration import SWEBenchLoader
 from detector.code_phase1_detector import CodePhase1Detector
 from detector.code_phase2_detector import CodePhase2Detector
+from detector.code_phase3_debugger import CodePhase3Debugger
+from detector.patch_verifier import DockerPatchVerifier
 
 
 class CodeExperimentRunner:
@@ -41,6 +43,20 @@ class CodeExperimentRunner:
         self.phase1_detector = CodePhase1Detector(llm, use_automatic_detection=True)
         self.phase2_detector = CodePhase2Detector(llm)
 
+        # Initialize Docker patch verifier (optional — graceful fallback)
+        self.verifier = None
+        try:
+            verifier = DockerPatchVerifier()
+            if verifier.is_available():
+                self.verifier = verifier
+                print("  Docker patch verifier: ENABLED")
+            else:
+                print("  Docker patch verifier: DISABLED (Docker or metadata not available)")
+        except Exception as e:
+            print(f"  Docker patch verifier: DISABLED ({e})")
+
+        self.phase3_debugger = CodePhase3Debugger(llm, verifier=self.verifier)
+
     async def run_single_trajectory(self, trajectory: Dict) -> Dict[str, Any]:
         """
         Run complete analysis on single trajectory using dual-channel detection
@@ -61,14 +77,28 @@ class CodeExperimentRunner:
         print("\n[Phase 1] Dual-channel error analysis (regex + LLM)...")
         phase1_dual_results = await self.phase1_detector.analyze_trajectory_dual(trajectory)
 
-        # Build regex-only view for Phase 2 compatibility
+        # Build regex-only view (kept for backward compat in saved results)
         phase1_regex_view = self._extract_regex_view(phase1_dual_results)
 
-        # Phase 2: Critical error identification (uses regex view)
+        # Build merged dual-channel view for Phase 2 (uses both regex + LLM errors)
+        phase1_merged_view = self._extract_merged_view(phase1_dual_results)
+
+        # Phase 2: Critical error identification (uses merged dual-channel view)
         print("\n[Phase 2] Critical error identification...")
         phase2_results = await self.phase2_detector.analyze_with_phase2(
-            phase1_regex_view, trajectory
+            phase1_merged_view, trajectory
         )
+
+        # Phase 3: Simulated iterative debugging (only for failed trajectories with critical errors)
+        phase3_results = None
+        if phase2_results.get('critical_error') is not None:
+            print("\n[Phase 3] Simulated iterative debugging...")
+            try:
+                phase3_results = await self.phase3_debugger.run_phase3(
+                    phase2_results, phase1_dual_results, trajectory
+                )
+            except Exception as e:
+                print(f"  Phase 3 error: {e}")
 
         # Combine results
         complete_results = {
@@ -76,6 +106,7 @@ class CodeExperimentRunner:
             'phase1': phase1_dual_results,
             'phase1_regex_view': phase1_regex_view,
             'phase2': phase2_results,
+            'phase3': phase3_results,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -114,6 +145,83 @@ class CodeExperimentRunner:
             },
             'total_cost': 0.0,
             'timestamp': dual_results.get('timestamp', '')
+        }
+
+    def _extract_merged_view(self, dual_results: Dict) -> Dict:
+        """Merge regex + LLM errors into a single view for Phase 2.
+
+        For each step-module, prefer the higher-confidence detection.
+        This gives Phase 2 a richer set of candidate errors to reason about,
+        rather than being limited to regex-only detections.
+        """
+        converted_steps = []
+        for step in dual_results['step_analyses']:
+            step_entry = {
+                'step_number': step['step_number'],
+                'detection_method': 'dual_channel',
+                'cost': 0.0,
+            }
+
+            for module in ['memory', 'reflection', 'planning', 'action', 'system']:
+                regex_err = step.get(f'regex_{module}_error')
+                llm_err = step.get(f'llm_{module}_error')
+
+                # Pick the best available error for this module
+                merged = None
+                if regex_err and llm_err:
+                    # Both detected — use whichever has higher confidence
+                    r_conf = regex_err.get('confidence', 0)
+                    l_conf = llm_err.get('confidence', 0)
+                    if r_conf >= l_conf:
+                        merged = regex_err
+                    else:
+                        merged = {
+                            'error_type': llm_err.get('error_type', 'unknown'),
+                            'confidence': llm_err.get('confidence', 0),
+                            'explanation': llm_err.get('explanation', ''),
+                        }
+                elif regex_err:
+                    merged = regex_err
+                elif llm_err:
+                    merged = {
+                        'error_type': llm_err.get('error_type', 'unknown'),
+                        'confidence': llm_err.get('confidence', 0),
+                        'explanation': llm_err.get('explanation', ''),
+                    }
+
+                step_entry[f'{module}_error'] = merged
+
+            converted_steps.append(step_entry)
+
+        dual_summary = dual_results.get('summary', {})
+        total_regex = dual_summary.get('regex_total_errors', 0)
+        total_llm = dual_summary.get('llm_total_errors', 0)
+
+        return {
+            'instance_id': dual_results['instance_id'],
+            'task_description': dual_results.get('task_description', ''),
+            'total_steps': dual_results['total_steps'],
+            'step_analyses': converted_steps,
+            'summary': {
+                'total_errors': total_regex + total_llm,
+                'automatic_detection_count': total_regex,
+                'automatic_detection_rate': 100.0,
+                'llm_detection_count': total_llm,
+                'errors_by_module': {
+                    **dual_summary.get('regex_errors_by_module', {}),
+                    **{k: dual_summary.get('llm_errors_by_module', {}).get(k, 0)
+                       for k in dual_summary.get('llm_errors_by_module', {})},
+                },
+                'errors_by_type': {
+                    **dual_summary.get('regex_errors_by_type', {}),
+                    **{k: dual_summary.get('llm_errors_by_type', {}).get(k, 0)
+                       for k in dual_summary.get('llm_errors_by_type', {})},
+                },
+                'total_cost': 0.0,
+                'cost_per_step': 0.0,
+            },
+            'total_cost': 0.0,
+            'timestamp': dual_results.get('timestamp', ''),
         }
 
     async def run_batch_experiments(self, trajectory_dir: str,
@@ -245,6 +353,60 @@ class CodeExperimentRunner:
             'average_steps_per_trajectory': 0.0,
             'average_errors_per_trajectory': 0.0,
             'automatic_detection_rate': 0.0,
+            # Phase 3: Simulated debugging stats
+            'phase3': {
+                'total_debugged': 0,
+                'simulated_success_count': 0,
+                'simulated_success_rate': 0.0,
+                'avg_iterations_to_success': 0.0,
+                'avg_iterations_total': 0.0,
+                'quality_distribution': {'high': 0, 'medium': 0, 'low': 0},
+                'avg_specificity': 0.0,
+                'avg_actionability': 0.0,
+                'convergence_rate': 0.0,
+                'convergence_count': 0,
+                'success_by_agreement': {},
+                'success_by_module': {},
+                'iteration_counts': [],
+                'iterations_to_success': [],
+                'all_specificity': [],
+                'all_actionability': [],
+                # Real verification stats
+                'real_verification_count': 0,
+                'real_patch_applied_count': 0,
+                'real_tests_run_count': 0,
+                'real_success_count': 0,
+                'real_success_rate': 0.0,
+                'real_success_by_agreement': {},
+                'real_success_by_module': {},
+                'simulated_vs_real_match_count': 0,
+                'simulated_vs_real_total': 0,
+                'prediction_accuracy': 0.0,
+                'avg_verification_duration': 0.0,
+                'all_verification_durations': [],
+                # Gold patch verification stats
+                'gold_verification_count': 0,
+                'gold_pass_count': 0,
+                'gold_pass_rate': 0.0,
+                'gold_failure_categories': {},
+                'env_compatible_count': 0,
+                'env_compatible_rate': 0.0,
+                'fair_comparison_count': 0,
+                # Three-tier comparison (only for fair_comparison_eligible instances)
+                'three_tier': {
+                    'total': 0,
+                    'both_pass': 0,
+                    'gold_only': 0,
+                    'corrective_only': 0,
+                    'neither': 0,
+                    'corrective_success_rate_fair': 0.0,
+                    'simulated_success_rate_fair': 0.0,
+                    'overconfidence_gap_fair': 0.0,
+                },
+                # Temp lists for fair comparison computation
+                '_fair_simulated_successes': 0,
+                '_fair_total': 0,
+            },
             # Dual-channel agreement stats
             'dual_channel': {
                 'total_module_comparisons': 0,
@@ -293,6 +455,94 @@ class CodeExperimentRunner:
                 stats['critical_errors_by_module'][module] = stats['critical_errors_by_module'].get(module, 0) + 1
                 stats['critical_errors_by_type'][error_type] = stats['critical_errors_by_type'].get(error_type, 0) + 1
 
+            # Phase 3 stats
+            phase3 = result.get('phase3')
+            if phase3:
+                p3 = stats['phase3']
+                p3['total_debugged'] += 1
+                p3['iteration_counts'].append(phase3['total_iterations'])
+                if phase3['final_success']:
+                    p3['simulated_success_count'] += 1
+                    if phase3['successful_iteration']:
+                        p3['iterations_to_success'].append(phase3['successful_iteration'])
+                quality = phase3.get('final_feedback_quality', 'low')
+                p3['quality_distribution'][quality] = p3['quality_distribution'].get(quality, 0) + 1
+                p3['all_specificity'].append(phase3.get('avg_specificity', 0))
+                p3['all_actionability'].append(phase3.get('avg_actionability', 0))
+                if phase3.get('convergence'):
+                    p3['convergence_count'] += 1
+                # Track success by agreement type
+                ag = phase3.get('dual_channel_agreement', 'unknown')
+                if ag not in p3['success_by_agreement']:
+                    p3['success_by_agreement'][ag] = {'total': 0, 'success': 0}
+                p3['success_by_agreement'][ag]['total'] += 1
+                if phase3['final_success']:
+                    p3['success_by_agreement'][ag]['success'] += 1
+                # Track success by error module
+                em = phase3.get('critical_error_module', 'unknown')
+                if em not in p3['success_by_module']:
+                    p3['success_by_module'][em] = {'total': 0, 'success': 0}
+                p3['success_by_module'][em]['total'] += 1
+                if phase3['final_success']:
+                    p3['success_by_module'][em]['success'] += 1
+
+                # Real verification stats
+                rv = phase3.get('real_verification')
+                if rv and isinstance(rv, dict) and 'tests_passed' in rv:
+                    p3['real_verification_count'] += 1
+                    if rv.get('patch_applied'):
+                        p3['real_patch_applied_count'] += 1
+                    if rv.get('tests_run'):
+                        p3['real_tests_run_count'] += 1
+                    if rv.get('tests_passed'):
+                        p3['real_success_count'] += 1
+                    if rv.get('duration_seconds'):
+                        p3['all_verification_durations'].append(rv['duration_seconds'])
+                    # Track simulated vs real match
+                    sim_vs_real = phase3.get('simulated_vs_real_match')
+                    if sim_vs_real is not None:
+                        p3['simulated_vs_real_total'] += 1
+                        if sim_vs_real:
+                            p3['simulated_vs_real_match_count'] += 1
+                    # Real success by agreement type
+                    if ag not in p3['real_success_by_agreement']:
+                        p3['real_success_by_agreement'][ag] = {'total': 0, 'success': 0}
+                    p3['real_success_by_agreement'][ag]['total'] += 1
+                    if rv.get('tests_passed'):
+                        p3['real_success_by_agreement'][ag]['success'] += 1
+                    # Real success by module
+                    if em not in p3['real_success_by_module']:
+                        p3['real_success_by_module'][em] = {'total': 0, 'success': 0}
+                    p3['real_success_by_module'][em]['total'] += 1
+                    if rv.get('tests_passed'):
+                        p3['real_success_by_module'][em]['success'] += 1
+
+                # Gold verification stats
+                gv = phase3.get('gold_verification')
+                if gv and isinstance(gv, dict) and 'tests_passed' in gv:
+                    p3['gold_verification_count'] += 1
+                    cat = gv.get('failure_category', 'unknown_error')
+                    p3['gold_failure_categories'][cat] = p3['gold_failure_categories'].get(cat, 0) + 1
+
+                    if gv.get('tests_passed'):
+                        p3['gold_pass_count'] += 1
+
+                    if phase3.get('env_compatible'):
+                        p3['env_compatible_count'] += 1
+
+                    if phase3.get('fair_comparison_eligible'):
+                        p3['fair_comparison_count'] += 1
+                        p3['_fair_total'] += 1
+                        if phase3.get('final_success'):
+                            p3['_fair_simulated_successes'] += 1
+
+                        # Three-tier comparison
+                        tier = phase3.get('corrective_vs_gold')
+                        if tier:
+                            p3['three_tier']['total'] += 1
+                            if tier in p3['three_tier']:
+                                p3['three_tier'][tier] += 1
+
             # Dual-channel stats
             dc = stats['dual_channel']
             if 'agreement_counts' in p1_summary:
@@ -334,6 +584,50 @@ class CodeExperimentRunner:
 
         if dc['total_llm_duration_seconds'] > 0 and stats['total_trajectories'] > 0:
             dc['avg_llm_duration_per_trajectory'] = dc['total_llm_duration_seconds'] / stats['total_trajectories']
+
+        # Compute Phase 3 final stats
+        p3 = stats['phase3']
+        if p3['total_debugged'] > 0:
+            p3['simulated_success_rate'] = round(p3['simulated_success_count'] / p3['total_debugged'] * 100, 1)
+            p3['avg_iterations_total'] = round(sum(p3['iteration_counts']) / len(p3['iteration_counts']), 2)
+            if p3['iterations_to_success']:
+                p3['avg_iterations_to_success'] = round(sum(p3['iterations_to_success']) / len(p3['iterations_to_success']), 2)
+            if p3['all_specificity']:
+                p3['avg_specificity'] = round(sum(p3['all_specificity']) / len(p3['all_specificity']), 3)
+            if p3['all_actionability']:
+                p3['avg_actionability'] = round(sum(p3['all_actionability']) / len(p3['all_actionability']), 3)
+            p3['convergence_rate'] = round(p3['convergence_count'] / p3['total_debugged'] * 100, 1)
+        # Real verification final computation
+        if p3['real_verification_count'] > 0:
+            p3['real_success_rate'] = round(p3['real_success_count'] / p3['real_verification_count'] * 100, 1)
+        if p3['simulated_vs_real_total'] > 0:
+            p3['prediction_accuracy'] = round(p3['simulated_vs_real_match_count'] / p3['simulated_vs_real_total'] * 100, 1)
+        if p3['all_verification_durations']:
+            p3['avg_verification_duration'] = round(sum(p3['all_verification_durations']) / len(p3['all_verification_durations']), 2)
+
+        # Gold verification final computation
+        if p3['gold_verification_count'] > 0:
+            p3['gold_pass_rate'] = round(p3['gold_pass_count'] / p3['gold_verification_count'] * 100, 1)
+            p3['env_compatible_rate'] = round(p3['env_compatible_count'] / p3['gold_verification_count'] * 100, 1)
+
+        # Three-tier final computation
+        tt = p3['three_tier']
+        if tt['total'] > 0:
+            corrective_pass = tt['both_pass'] + tt.get('corrective_only', 0)
+            tt['corrective_success_rate_fair'] = round(corrective_pass / tt['total'] * 100, 1)
+        if p3['_fair_total'] > 0:
+            tt['simulated_success_rate_fair'] = round(p3['_fair_simulated_successes'] / p3['_fair_total'] * 100, 1)
+            fair_real = tt.get('corrective_success_rate_fair', 0.0)
+            tt['overconfidence_gap_fair'] = round(tt['simulated_success_rate_fair'] - fair_real, 1)
+
+        # Clean up temp lists from serialization
+        del p3['iteration_counts']
+        del p3['iterations_to_success']
+        del p3['all_specificity']
+        del p3['all_actionability']
+        del p3['all_verification_durations']
+        del p3['_fair_simulated_successes']
+        del p3['_fair_total']
 
         # Sort by frequency
         stats['errors_by_module'] = dict(sorted(stats['errors_by_module'].items(), key=lambda x: x[1], reverse=True))
@@ -397,6 +691,69 @@ class CodeExperimentRunner:
             print(f"  LLM only (regex missed): {ac.get('llm_only', 0)} ({ac.get('llm_only',0)/total_comp*100:.1f}%)")
             print(f"  Avg LLM time/trajectory: {dc.get('avg_llm_duration_per_trajectory', 0):.1f}s")
             print(f"  LLM timeouts: {dc.get('llm_timeouts', 0)}")
+
+        # Phase 3 report
+        p3 = stats.get('phase3', {})
+        if p3.get('total_debugged', 0) > 0:
+            print(f"\n## Phase 3: Simulated Iterative Debugging")
+            print(f"  Trajectories debugged: {p3['total_debugged']}")
+            print(f"  Simulated success rate: {p3['simulated_success_rate']:.1f}%")
+            print(f"  Avg iterations (total): {p3['avg_iterations_total']:.1f}")
+            print(f"  Avg iterations to success: {p3['avg_iterations_to_success']:.1f}")
+            print(f"  Feedback quality: high={p3['quality_distribution'].get('high',0)}, "
+                  f"medium={p3['quality_distribution'].get('medium',0)}, "
+                  f"low={p3['quality_distribution'].get('low',0)}")
+            print(f"  Avg specificity: {p3['avg_specificity']:.3f}")
+            print(f"  Avg actionability: {p3['avg_actionability']:.3f}")
+            print(f"  Convergence rate: {p3['convergence_rate']:.1f}%")
+            if p3.get('success_by_agreement'):
+                print(f"  Success by agreement type:")
+                for ag_type, counts in p3['success_by_agreement'].items():
+                    rate = counts['success'] / counts['total'] * 100 if counts['total'] > 0 else 0
+                    print(f"    {ag_type}: {counts['success']}/{counts['total']} ({rate:.1f}%)")
+
+            # Real Docker verification report
+            if p3.get('real_verification_count', 0) > 0:
+                print(f"\n## Phase 3: Real Docker Verification")
+                print(f"  Patches verified: {p3['real_verification_count']}")
+                print(f"  Patches applied: {p3['real_patch_applied_count']}")
+                print(f"  Tests run: {p3['real_tests_run_count']}")
+                print(f"  Tests PASSED (real): {p3['real_success_count']} ({p3['real_success_rate']:.1f}%)")
+                print(f"  Simulated success rate: {p3['simulated_success_rate']:.1f}%")
+                print(f"  Prediction accuracy: {p3['prediction_accuracy']:.1f}%")
+                gap = p3['simulated_success_rate'] - p3['real_success_rate']
+                print(f"  Overconfidence gap: {gap:.1f}% (simulated - real)")
+                print(f"  Avg verification time: {p3['avg_verification_duration']:.1f}s")
+                if p3.get('real_success_by_agreement'):
+                    print(f"  Real success by agreement type:")
+                    for ag_type, counts in p3['real_success_by_agreement'].items():
+                        rate = counts['success'] / counts['total'] * 100 if counts['total'] > 0 else 0
+                        print(f"    {ag_type}: {counts['success']}/{counts['total']} ({rate:.1f}%)")
+
+            # Gold patch verification report
+            if p3.get('gold_verification_count', 0) > 0:
+                print(f"\n## Phase 3: Gold Patch Verification (Ceiling Baseline)")
+                print(f"  Gold patches verified: {p3['gold_verification_count']}")
+                print(f"  Gold patches PASSED: {p3['gold_pass_count']} ({p3['gold_pass_rate']:.1f}%)")
+                print(f"  Environment compatible: {p3['env_compatible_count']} ({p3['env_compatible_rate']:.1f}%)")
+                print(f"  Fair comparison eligible: {p3['fair_comparison_count']}")
+
+                if p3.get('gold_failure_categories'):
+                    print(f"  Gold failure breakdown:")
+                    for cat, count in sorted(p3['gold_failure_categories'].items(), key=lambda x: -x[1]):
+                        pct = count / p3['gold_verification_count'] * 100
+                        print(f"    {cat}: {count} ({pct:.1f}%)")
+
+                tt = p3.get('three_tier', {})
+                if tt.get('total', 0) > 0:
+                    print(f"\n## Three-Tier Comparison (N={tt['total']} fair instances)")
+                    print(f"  Gold + Corrective both pass: {tt['both_pass']}")
+                    print(f"  Gold only (corrective failed): {tt['gold_only']}")
+                    print(f"  Corrective only (anomaly): {tt['corrective_only']}")
+                    print(f"  Neither passed: {tt['neither']}")
+                    print(f"  Corrective success rate (fair): {tt['corrective_success_rate_fair']:.1f}%")
+                    print(f"  Simulated success rate (fair): {tt['simulated_success_rate_fair']:.1f}%")
+                    print(f"  OVERCONFIDENCE GAP (fair): {tt['overconfidence_gap_fair']:.1f}%")
 
         print("\n" + "="*80)
 

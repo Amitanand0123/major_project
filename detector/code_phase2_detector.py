@@ -89,7 +89,9 @@ Analyze each error and identify THE SINGLE MOST CRITICAL ERROR that caused failu
 CRITICAL RULES:
 - Step 1 CANNOT have memory or reflection errors (no prior context exists)
 - If you select Step 1, it MUST be planning, action, or system error
-- Choose the EARLIEST critical error in the propagation chain
+- Focus on the error with the HIGHEST IMPACT, not necessarily the earliest one
+- An error at step 1 is only critical if it directly causes downstream failures; do not select step 1 errors if later errors are more impactful
+- Prefer high-confidence errors (confidence >= 0.8) over low-confidence ones
 
 Respond in this EXACT format:
 STEP_NUMBER: <number>
@@ -102,12 +104,12 @@ PROPAGATION: <how this error led to subsequent failures, separated by ' -> '>
 
 IMPORTANT CONSTRAINTS:
 1. MODULE must be one of the 5 cognitive modules (memory, reflection, planning, action, system), NOT a file name or package name!
-2. ERROR_TYPE must be one of these 17 valid types from the AgentErrorTaxonomy:
+2. ERROR_TYPE must be one of these valid types from the AgentErrorTaxonomy:
 
    Memory errors: dependency_omission, file_location_forgetting, over_simplification, hallucination, retrieval_failure
    Reflection errors: progress_misjudge, outcome_misinterpretation, error_dismissal, repetition_blindness
    Planning errors: constraint_ignorance, impossible_action, inefficient_plan, redundant_plan, api_hallucination, scope_violation, test_interpretation_error
-   Action errors: format_error, parameter_error, misalignment, syntax_error, indentation_error, logic_error
+   Action errors: format_error, parameter_error, misalignment, syntax_error, indentation_error, logic_error, wrong_file_edit
    System errors: step_limit_exhaustion, tool_execution_error, environment_error, compilation_timeout, test_timeout
 
    DO NOT invent new error types like "user_input_error", "FileNotFoundError", "missing_test_case", etc.
@@ -129,12 +131,41 @@ Response:"""
         # Parse response
         critical_error = self._parse_critical_error_response(response_text)
 
+        # Fallback when LLM response can't be parsed (common with high-error trajectories)
+        if critical_error is None:
+            print("⚠️ LLM response could not be parsed. Selecting highest-confidence Phase 1 error as fallback.")
+            fallback = self._select_fallback_critical_error(step_analyses)
+            if fallback:
+                print(f"   Fallback selected: {fallback.error_type} at step {fallback.step_number} (conf: {fallback.confidence:.2f})")
+                return fallback
+            else:
+                print("   No fallback available — no Phase 1 errors found.")
+                return None
+
         # Validate Step 1 errors
         if critical_error and critical_error.step_number == 1:
+            reject = False
+            reason = ""
+
             if critical_error.module in ['memory', 'reflection']:
-                print(f"⚠️ WARNING: Step 1 cannot have {critical_error.module} error!")
-                if retry_count < 3:
-                    print(f"   Retrying... (attempt {retry_count + 1}/3)")
+                reject = True
+                reason = f"Step 1 cannot have {critical_error.module} error"
+            elif critical_error.confidence < 0.7:
+                reject = True
+                reason = f"Step 1 error has low confidence ({critical_error.confidence:.2f})"
+            elif critical_error.error_type == 'scope_violation' and critical_error.confidence < 0.8:
+                reject = True
+                reason = f"Step 1 scope_violation has low confidence ({critical_error.confidence:.2f}), likely boilerplate false positive"
+
+            if reject:
+                print(f"⚠️ WARNING: {reason}!")
+                # Try to find a better error from later steps first
+                fallback = self._select_fallback_critical_error(step_analyses, skip_step1=True)
+                if fallback:
+                    print(f"   Using fallback: {fallback.error_type} at step {fallback.step_number}")
+                    return fallback
+                elif retry_count < 3:
+                    print(f"   No later-step fallback. Retrying LLM... (attempt {retry_count + 1}/3)")
                     return await self.identify_critical_error(
                         phase1_results, original_trajectory, retry_count + 1
                     )
@@ -144,33 +175,96 @@ Response:"""
 
         return critical_error
 
-    def _build_error_summary(self, step_analyses: List[Dict]) -> str:
-        """Build summary of all errors from Phase 1"""
-        lines = []
+    def _build_error_summary(self, step_analyses: List[Dict], max_chars: int = 3500) -> str:
+        """Build summary of all errors from Phase 1, truncated to fit prompt limits.
 
+        For trajectories with many errors, we prioritize high-confidence errors
+        and include a compact summary of the rest.
+        """
+        # Collect all errors with metadata
+        all_errors = []
         for analysis in step_analyses:
             step_num = analysis['step_number']
-            errors = []
-
             for module in ['memory', 'reflection', 'planning', 'action', 'system']:
                 error_key = f'{module}_error'
                 if analysis.get(error_key):
                     error = analysis[error_key]
-                    errors.append(f"  - {module.upper()}: {error['error_type']} (conf: {error['confidence']:.2f})")
-                    errors.append(f"    Explanation: {error['explanation']}")
+                    all_errors.append({
+                        'step': step_num,
+                        'module': module,
+                        'type': error['error_type'],
+                        'confidence': error.get('confidence', 0.5),
+                        'explanation': error.get('explanation', ''),
+                    })
 
-            if errors:
-                lines.append(f"\n## Step {step_num}")
-                lines.extend(errors)
+        if not all_errors:
+            return "No errors detected."
 
-        return "\n".join(lines) if lines else "No errors detected."
+        # If few errors, include all with full detail
+        if len(all_errors) <= 20:
+            lines = []
+            for analysis in step_analyses:
+                step_num = analysis['step_number']
+                errors = []
+                for module in ['memory', 'reflection', 'planning', 'action', 'system']:
+                    error_key = f'{module}_error'
+                    if analysis.get(error_key):
+                        error = analysis[error_key]
+                        errors.append(f"  - {module.upper()}: {error['error_type']} (conf: {error['confidence']:.2f})")
+                        errors.append(f"    Explanation: {error['explanation']}")
+                if errors:
+                    lines.append(f"\n## Step {step_num}")
+                    lines.extend(errors)
+            return "\n".join(lines)
+
+        # Many errors: show top errors by confidence, ensuring all modules represented
+        sorted_errors = sorted(all_errors, key=lambda e: e['confidence'], reverse=True)
+        # Ensure at least top 2 errors per module are included
+        top_errors = []
+        module_counts = {}
+        for e in sorted_errors:
+            m = e['module']
+            module_counts.setdefault(m, 0)
+            if module_counts[m] < 2 or len(top_errors) < 30:
+                top_errors.append(e)
+                module_counts[m] += 1
+            if len(top_errors) >= 30:
+                break
+
+        lines = [f"(Total: {len(all_errors)} errors across {len(step_analyses)} steps. Showing top {len(top_errors)} by confidence.)\n"]
+        for e in top_errors:
+            lines.append(f"Step {e['step']} | {e['module'].upper()} | {e['type']} | conf={e['confidence']:.2f}")
+            expl = e['explanation'][:120] + "..." if len(e['explanation']) > 120 else e['explanation']
+            lines.append(f"  {expl}")
+
+        # Add type frequency summary
+        from collections import Counter
+        type_counts = Counter(e['type'] for e in all_errors)
+        lines.append(f"\nError type frequency: {dict(type_counts.most_common(8))}")
+
+        result = "\n".join(lines)
+        if len(result) > max_chars:
+            result = result[:max_chars] + "\n... (truncated)"
+        return result
 
     def _build_trajectory_summary(self, trajectory: Dict) -> str:
-        """Build summary of trajectory for context"""
+        """Build summary of trajectory for context.
+
+        Shows first 5 + last 5 steps to capture both early context and
+        late-trajectory errors that often matter most.
+        """
         steps = trajectory.get('steps', [])
         lines = []
 
-        for step in steps[:10]:  # Limit to first 10 steps
+        if len(steps) <= 12:
+            # Short trajectory: show all steps
+            show_steps = steps
+        else:
+            # Long trajectory: first 5 + last 5
+            show_steps = steps[:5]
+            lines_before_gap = len(show_steps)
+
+        for i, step in enumerate(steps[:5] if len(steps) > 12 else steps):
             step_num = step.get('step_number', '?')
             action = step.get('modules', {}).get('action', 'N/A')[:100]
             obs = step.get('observation', 'N/A')[:150]
@@ -179,8 +273,17 @@ Response:"""
             lines.append(f"  Action: {action}")
             lines.append(f"  Result: {obs}...")
 
-        if len(steps) > 10:
-            lines.append(f"\n... ({len(steps) - 10} more steps)")
+        if len(steps) > 12:
+            lines.append(f"\n... ({len(steps) - 10} middle steps omitted) ...")
+
+            for step in steps[-5:]:
+                step_num = step.get('step_number', '?')
+                action = step.get('modules', {}).get('action', 'N/A')[:100]
+                obs = step.get('observation', 'N/A')[:150]
+
+                lines.append(f"\nStep {step_num}:")
+                lines.append(f"  Action: {action}")
+                lines.append(f"  Result: {obs}...")
 
         return "\n".join(lines)
 
@@ -201,7 +304,7 @@ Response:"""
             if line.startswith('STEP_NUMBER:'):
                 try:
                     step_number = int(line.replace('STEP_NUMBER:', '').strip())
-                except:
+                except (ValueError, TypeError):
                     pass
             elif line.startswith('MODULE:'):
                 module = line.replace('MODULE:', '').strip().lower()
@@ -210,7 +313,7 @@ Response:"""
             elif line.startswith('CONFIDENCE:'):
                 try:
                     confidence = float(line.replace('CONFIDENCE:', '').strip())
-                except:
+                except (ValueError, TypeError):
                     confidence = 0.5
             elif line.startswith('EXPLANATION:'):
                 explanation = line.replace('EXPLANATION:', '').strip()
@@ -245,7 +348,7 @@ Response:"""
             'test_interpretation_error',
             # Action module errors
             'format_error', 'parameter_error', 'misalignment', 'syntax_error',
-            'indentation_error', 'logic_error',
+            'indentation_error', 'logic_error', 'wrong_file_edit',
             # System module errors
             'step_limit_exhaustion', 'tool_execution_error', 'environment_error',
             'compilation_timeout', 'test_timeout'
@@ -311,6 +414,7 @@ Response:"""
             'syntax_error': 'action',
             'indentation_error': 'action',
             'logic_error': 'action',
+            'wrong_file_edit': 'action',
 
             # System module errors
             'step_limit_exhaustion': 'system',
@@ -378,14 +482,24 @@ Response:"""
 
         return None
 
-    def _select_fallback_critical_error(self, step_analyses: List[Dict]) -> Optional[CriticalError]:
-        """Select fallback critical error if LLM fails validation"""
-        # Find first non-Step-1-memory/reflection error with highest confidence
+    def _select_fallback_critical_error(self, step_analyses: List[Dict],
+                                        skip_step1: bool = False) -> Optional[CriticalError]:
+        """Select fallback critical error if LLM fails validation.
+
+        Args:
+            step_analyses: Phase 1 step analysis data
+            skip_step1: If True, skip all step 1 errors entirely (used when
+                        step 1 was already rejected as likely false positive)
+        """
         best_error = None
         best_confidence = 0.0
 
         for analysis in step_analyses:
             step_num = analysis['step_number']
+
+            # Skip step 1 entirely if requested
+            if skip_step1 and step_num == 1:
+                continue
 
             for module in ['planning', 'action', 'system', 'memory', 'reflection']:
                 error_key = f'{module}_error'
@@ -403,7 +517,7 @@ Response:"""
                             module=module,
                             error_type=error['error_type'],
                             confidence=error['confidence'],
-                            explanation=error['explanation'],
+                            explanation=error.get('explanation', ''),
                             impact_analysis="Fallback selection: highest confidence valid error",
                             counterfactual_reasoning="Unable to determine via LLM",
                             propagation_chain=[]

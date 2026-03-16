@@ -11,6 +11,30 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 
+# SWE-bench boilerplate phrases that appear in step 1 observations
+# and can trigger false positives in regex patterns.
+_SWEBENCH_BOILERPLATE_PHRASES = [
+    "Edit all the files you need to and run any checks or tests that you want.",
+    "YOU CAN ONLY ENTER ONE COMMAND AT A TIME",
+    "You should always wait for feedback after every command",
+    "the special interface to help you",
+    "SETTING UP REPOSITORY",
+    "We're currently solving the following issue within our repository",
+    "We are currently solving the following issue within our repository",
+    "OBSERVATION:",
+]
+
+_BOILERPLATE_RE = re.compile(
+    '|'.join(re.escape(phrase) for phrase in _SWEBENCH_BOILERPLATE_PHRASES),
+    re.IGNORECASE
+)
+
+
+def _strip_swebench_boilerplate(text: str) -> str:
+    """Remove known SWE-bench instruction boilerplate from text to prevent false positives."""
+    return _BOILERPLATE_RE.sub('', text)
+
+
 @dataclass
 class DetectedError:
     """An error detected by the automatic (regex) engine"""
@@ -167,7 +191,7 @@ class AutomaticErrorDetector:
 
     def __init__(self):
         self.patterns = ALL_PATTERNS
-        self._seen_errors = {}  # Track repeated errors for repetition_blindness
+        pass
 
     def detect_from_output(self, observation: str, step_number: int) -> List[DetectedError]:
         """
@@ -184,10 +208,11 @@ class AutomaticErrorDetector:
             return []
 
         errors = []
-        seen_modules = set()  # Only one error per module per step
+        seen_error_types = set()  # Deduplicate by (module, error_type) pair
 
         for pattern, module, error_type, confidence in self.patterns:
-            if module in seen_modules:
+            dedup_key = (module, error_type)
+            if dedup_key in seen_error_types:
                 continue
 
             match = pattern.search(observation)
@@ -203,7 +228,7 @@ class AutomaticErrorDetector:
                     confidence=confidence,
                     evidence=evidence
                 ))
-                seen_modules.add(module)
+                seen_error_types.add(dedup_key)
 
         return errors
 
@@ -266,22 +291,17 @@ class AutomaticErrorDetector:
             re.compile(r'open\s+(\S+\.py)', re.IGNORECASE),
         ]
 
-        # Extract repo name from instance_id (format: owner__repo-issue)
-        expected_files = set()
-        if instance_id:
-            parts = instance_id.split('__')
-            if len(parts) >= 2:
-                repo_parts = parts[1].rsplit('-', 1)
-                if repo_parts:
-                    expected_files.add(repo_parts[0].replace('-', '_'))
-
         # Check for scope violation indicators in observation
         scope_patterns = [
             (re.compile(r'modif(y|ying|ied)\s+(files?\s+)?(outside|beyond)', re.IGNORECASE), 0.85),
-            (re.compile(r'edit(ing|ed)?\s+.*test.*(?!that was)', re.IGNORECASE), 0.6),
+            (re.compile(r'edit(ing|ed)\s+(?:a\s+)?(?:different|unrelated|wrong)\s+(?:file|module)', re.IGNORECASE), 0.75),
         ]
 
         combined = action + ' ' + observation
+
+        # Strip SWE-bench boilerplate instructions that cause false positives
+        combined = _strip_swebench_boilerplate(combined)
+
         for pattern, confidence in scope_patterns:
             match = pattern.search(combined)
             if match:

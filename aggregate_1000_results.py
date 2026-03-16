@@ -58,6 +58,28 @@ class StudyAggregator:
             'critical_errors_by_module': defaultdict(int),
             'critical_errors_by_type': defaultdict(int),
             'batch_summaries': [],
+            # Phase 3 aggregate stats
+            'phase3': {
+                'total_debugged': 0,
+                'simulated_success_count': 0,
+                'convergence_count': 0,
+                'real_verification_count': 0,
+                'real_patch_applied_count': 0,
+                'real_tests_run_count': 0,
+                'real_success_count': 0,
+                'gold_verification_count': 0,
+                'gold_pass_count': 0,
+                'env_compatible_count': 0,
+                'fair_comparison_count': 0,
+                'quality_distribution': defaultdict(int),
+                'gold_failure_categories': defaultdict(int),
+                'three_tier': {'total': 0, 'both_pass': 0, 'gold_only': 0, 'corrective_only': 0, 'neither': 0},
+                '_sum_specificity': 0.0,
+                '_sum_actionability': 0.0,
+                '_sum_iterations': 0.0,
+                'success_by_module': defaultdict(lambda: {'total': 0, 'success': 0}),
+                'real_success_by_module': defaultdict(lambda: {'total': 0, 'success': 0}),
+            },
             # Dual-channel aggregate stats
             'dual_channel': {
                 'total_module_comparisons': 0,
@@ -87,7 +109,7 @@ class StudyAggregator:
                 print(f"  ⚠️ Warning: No run directory found for batch {batch_num}")
                 continue
 
-            run_dir = run_dirs[0]
+            run_dir = sorted(run_dirs)[-1]  # pick latest run directory
             agg_file = run_dir / "experiments" / "aggregate_statistics.json"
 
             if not agg_file.exists():
@@ -120,6 +142,44 @@ class StudyAggregator:
 
             for error_type, count in batch_stats['critical_errors_by_type'].items():
                 aggregate['critical_errors_by_type'][error_type] += count
+
+            # Phase 3 stats
+            batch_p3 = batch_stats.get('phase3', {})
+            if batch_p3:
+                p3 = aggregate['phase3']
+                p3['total_debugged'] += batch_p3.get('total_debugged', 0)
+                p3['simulated_success_count'] += batch_p3.get('simulated_success_count', 0)
+                p3['convergence_count'] += batch_p3.get('convergence_count', 0)
+                p3['real_verification_count'] += batch_p3.get('real_verification_count', 0)
+                p3['real_patch_applied_count'] += batch_p3.get('real_patch_applied_count', 0)
+                p3['real_tests_run_count'] += batch_p3.get('real_tests_run_count', 0)
+                p3['real_success_count'] += batch_p3.get('real_success_count', 0)
+                p3['gold_verification_count'] += batch_p3.get('gold_verification_count', 0)
+                p3['gold_pass_count'] += batch_p3.get('gold_pass_count', 0)
+                p3['env_compatible_count'] += batch_p3.get('env_compatible_count', 0)
+                p3['fair_comparison_count'] += batch_p3.get('fair_comparison_count', 0)
+                # Quality distribution
+                for qual in ('high', 'medium', 'low'):
+                    p3['quality_distribution'][qual] += batch_p3.get('quality_distribution', {}).get(qual, 0)
+                # Gold failure categories
+                for cat, cnt in batch_p3.get('gold_failure_categories', {}).items():
+                    p3['gold_failure_categories'][cat] += cnt
+                # Three-tier
+                batch_tier = batch_p3.get('three_tier', {})
+                if batch_tier:
+                    for key in ('total', 'both_pass', 'gold_only', 'corrective_only', 'neither'):
+                        p3['three_tier'][key] += batch_tier.get(key, 0)
+                # Accumulate for averaging
+                p3['_sum_specificity'] += batch_p3.get('avg_specificity', 0) * batch_p3.get('total_debugged', 0)
+                p3['_sum_actionability'] += batch_p3.get('avg_actionability', 0) * batch_p3.get('total_debugged', 0)
+                p3['_sum_iterations'] += batch_p3.get('avg_iterations_total', 0) * batch_p3.get('total_debugged', 0)
+                # Success by module
+                for mod, data in batch_p3.get('success_by_module', {}).items():
+                    p3['success_by_module'][mod]['total'] += data.get('total', 0)
+                    p3['success_by_module'][mod]['success'] += data.get('success', 0)
+                for mod, data in batch_p3.get('real_success_by_module', {}).items():
+                    p3['real_success_by_module'][mod]['total'] += data.get('total', 0)
+                    p3['real_success_by_module'][mod]['success'] += data.get('success', 0)
 
             # Dual-channel stats
             batch_dc = batch_stats.get('dual_channel', {})
@@ -167,6 +227,34 @@ class StudyAggregator:
             dc['agreement_rate'] = (agree / total_comp) * 100
         if dc['total_llm_duration_seconds'] > 0 and aggregate['study_info']['total_trajectories'] > 0:
             dc['avg_llm_duration_per_trajectory'] = dc['total_llm_duration_seconds'] / aggregate['study_info']['total_trajectories']
+
+        # Compute Phase 3 derived statistics
+        p3 = aggregate['phase3']
+        if p3['total_debugged'] > 0:
+            p3['simulated_success_rate'] = round(p3['simulated_success_count'] / p3['total_debugged'] * 100, 1)
+            p3['convergence_rate'] = round(p3['convergence_count'] / p3['total_debugged'] * 100, 1)
+            p3['avg_specificity'] = round(p3['_sum_specificity'] / p3['total_debugged'], 3)
+            p3['avg_actionability'] = round(p3['_sum_actionability'] / p3['total_debugged'], 3)
+            p3['avg_iterations_total'] = round(p3['_sum_iterations'] / p3['total_debugged'], 2)
+        if p3['real_verification_count'] > 0:
+            p3['real_success_rate'] = round(p3['real_success_count'] / p3['real_verification_count'] * 100, 1)
+        if p3['gold_verification_count'] > 0:
+            p3['gold_pass_rate'] = round(p3['gold_pass_count'] / p3['gold_verification_count'] * 100, 1)
+        if p3['env_compatible_count'] > 0:
+            p3['env_compatible_rate'] = round(p3['env_compatible_count'] / p3['gold_verification_count'] * 100, 1)
+        if p3['fair_comparison_count'] > 0:
+            fair_n = p3['fair_comparison_count']
+            tier = p3['three_tier']
+            tier['corrective_success_rate_fair'] = round(tier['both_pass'] / fair_n * 100, 1) if fair_n > 0 else 0.0
+            # Simulated success among fair instances (need to compute from batch data)
+        # Remove internal accumulator fields
+        for key in ('_sum_specificity', '_sum_actionability', '_sum_iterations'):
+            del p3[key]
+        # Convert defaultdicts
+        p3['quality_distribution'] = dict(p3['quality_distribution'])
+        p3['gold_failure_categories'] = dict(p3['gold_failure_categories'])
+        p3['success_by_module'] = {k: dict(v) for k, v in p3['success_by_module'].items()}
+        p3['real_success_by_module'] = {k: dict(v) for k, v in p3['real_success_by_module'].items()}
 
         # Compute derived statistics
         if aggregate['total_errors_detected'] > 0:
@@ -281,6 +369,28 @@ class StudyAggregator:
             print(f"  LLM Errors by Module:")
             for module, count in sorted(dc.get('llm_errors_by_module', {}).items(), key=lambda x: -x[1]):
                 print(f"    {module:12s}: {count}")
+            print()
+
+        # Phase 3 stats
+        p3 = aggregate.get('phase3', {})
+        if p3.get('total_debugged', 0) > 0:
+            print(f"Phase 3 - Iterative Debugging:")
+            print(f"  Total debugged: {p3['total_debugged']}")
+            print(f"  Simulated success: {p3.get('simulated_success_count', 0)} ({p3.get('simulated_success_rate', 0):.1f}%)")
+            print(f"  Real success: {p3.get('real_success_count', 0)} ({p3.get('real_success_rate', 0):.1f}%)")
+            print(f"  Gold pass: {p3.get('gold_pass_count', 0)} ({p3.get('gold_pass_rate', 0):.1f}%)")
+            print(f"  Env compatible: {p3.get('env_compatible_count', 0)} ({p3.get('env_compatible_rate', 0):.1f}%)")
+            print(f"  Fair comparison: {p3.get('fair_comparison_count', 0)}")
+            print(f"  Quality distribution: {p3.get('quality_distribution', {})}")
+            print(f"  Avg specificity: {p3.get('avg_specificity', 0):.3f}")
+            print(f"  Avg actionability: {p3.get('avg_actionability', 0):.3f}")
+            tier = p3.get('three_tier', {})
+            if tier.get('total', 0) > 0:
+                print(f"  Three-Tier Comparison (N={tier['total']}):")
+                print(f"    both_pass: {tier.get('both_pass', 0)}")
+                print(f"    gold_only: {tier.get('gold_only', 0)}")
+                print(f"    corrective_only: {tier.get('corrective_only', 0)}")
+                print(f"    neither: {tier.get('neither', 0)}")
             print()
 
         # Batch consistency
