@@ -16,9 +16,10 @@
 \usepackage{needspace}
 
 % Prevent text from overflowing column boundaries
-\emergencystretch=1em
-\tolerance=1000
+\emergencystretch=2em
+\tolerance=2000
 \hyphenpenalty=50
+\sloppy
 
 \begin{document}
 
@@ -195,7 +196,7 @@ Let $T = \{s_1, s_2, \ldots, s_n\}$ be an agent trajectory of $n$ steps, where e
 \begin{enumerate}
     \item \textbf{Detect} errors through two independent channels, a regex channel $E^R$ and an LLM channel $E^L$, characterizing each error by its cognitive module, taxonomy type, and step location.
     \item \textbf{Compare} the channels by computing, for every step--module pair, whether both detected an error, neither did, or only one of them did.
-    \item \textbf{Identify} the root-cause error $e^* = \arg\max_{e \in E^R \cup E^L} \text{impact}(e)$ via counterfactual reasoning.
+    \item \textbf{Identify} the root-cause error $e^* \!=\! \arg\max_{e \in E^R \cup E^L}\text{impact}(e)$ via counterfactual reasoning.
 \end{enumerate}
 
 Fig.~\ref{fig:architecture} shows the complete pipeline.
@@ -203,7 +204,7 @@ Fig.~\ref{fig:architecture} shows the complete pipeline.
 \begin{figure*}[ht!]
 \centering
 \includegraphics[width=0.95\textwidth]{figures/agent_debug_architecture.png}
-\caption{The AgentDebug pipeline. Phase~1 passes every step through two independent channels: Channel~A (95 regex patterns) and Channel~B (local LLM). Phase~2 applies counterfactual reasoning with three-layer validation to identify the root-cause error. Phase~3 (Section~\ref{sec:phase3}) generates corrective patches and verifies them against real test suites.}
+\caption{The AgentDebug pipeline. Phase~1 passes every step through two independent channels: Channel~A (95~regex patterns) and Channel~B (local~LLM). Phase~2 applies counterfactual reasoning with three-layer validation to identify the root-cause error. Phase~3 generates corrective patches and verifies them against real test suites.}
 \label{fig:architecture}
 \end{figure*}
 
@@ -386,6 +387,7 @@ Regex errors detected             & 1,662 \\
 \hline
 LLM errors detected               & 13,616 \\
 \hline
+\end{tabularx}
 \end{table}
 
 \subsection{Processing and Computing Environment}
@@ -766,24 +768,10 @@ The dual-channel data point to four concrete interventions that agent builders c
 % ============================================================
 % IX. DISCUSSION AND LIMITATIONS
 % ============================================================
-\section{Discussion and Limitations}
+\section{Limitations}
 \label{sec:discussion}
 
-\subsection{Dual-Channel Design}
-
-The two channels operate at different abstraction levels: regex catches syntactic symptoms while the LLM names semantic causes. The same bug can manifest as a \texttt{SyntaxError} in regex and a \texttt{wrong\_file\_edit} in the LLM, and both labels are correct at their respective level. When both channels flag the same step-module pair (1,051 cases), they typically assign different error types---reflecting this abstraction difference rather than disagreement. The LLM channel identifies a substantially broader set of potential issues than regex, but its precision has not been formally validated against human ground truth. A preliminary manual inspection of 100 LLM-detected errors suggests that 60--80\% are valid or plausible for cognitive error types, though this estimate should be treated as indicative rather than definitive. The channel's credibility is partly supported by the 1,051 \texttt{both\_error} cases and by a stronger correlation with failure outcomes (1.28$\times$ per-step elevation in failing trajectories vs.\ 1.06$\times$ for regex). A rigorous precision study with multiple human annotators remains an important direction for future work.
-
-\subsection{Limitations}
-
-Several limitations should be kept in mind. The taxonomy and regex patterns target Python-based SWE-bench trajectories from a single agent framework (SWE-agent with LLaMA); error distributions may look different for other languages, domains, or architectures. All inference used Qwen2.5-Coder:7B, a 7B-parameter model; larger models may yield different error distributions and more nuanced root-cause identification. The LLM channel's 8.2$\times$ detection multiplier relative to regex includes a substantial proportion of interpretive judgments (e.g., ``scope violation,'' ``wrong file edit'') that, while often plausible, have not been validated against human annotation; future work should include a precision study on a sample of LLM-only detections.
-
-\subsection{Threats to Validity}
-
-\textbf{Internal validity.} The LLM detection channel (Phase~1) and the root-cause identifier (Phase~2) use the same 7B model class. This creates a risk of systematic blind spots---the model may consistently overlook certain error categories. Additionally, Phase~2 critical error identification relies on a single model rather than multiple independent annotators; inter-rater reliability has not been established.
-
-\textbf{External validity.} Our findings are drawn from SWE-agent trajectories using LLaMA-based models on Python repositories from SWE-bench. Different agent architectures (e.g., OpenHands, Agentless), different base models (e.g., GPT-4, Claude), different programming languages, and different task types may yield substantially different error distributions.
-
-\textbf{Construct validity.} The term ``error'' carries different meanings across the two detection channels. Regex patterns flag syntactic events (a traceback, a timeout, a malformed edit command); the LLM channel labels semantic failures (a conceptual misunderstanding, a scope violation, a hallucinated API). The 8.2$\times$ detection multiplier does not mean the LLM finds 8.2$\times$ more ``real'' errors---it means the LLM applies a broader, more interpretive definition of what constitutes an error. Both definitions are useful, but they should not be treated as interchangeable.
+Several limitations apply. The taxonomy and regex patterns target Python-based SWE-bench trajectories from a single agent framework (SWE-agent with LLaMA); error distributions may differ for other languages, domains, or architectures. Both the Phase~1 LLM channel and the Phase~2 root-cause identifier use the same 7B model class (Qwen2.5-Coder:7B), creating a risk of systematic blind spots and precluding inter-rater reliability assessment. The LLM channel's 8.2$\times$ detection multiplier includes interpretive judgments (e.g., ``scope violation,'' ``wrong file edit'') that have not been validated against human ground truth; a preliminary inspection of 100 LLM-detected errors suggests 60--80\% are plausible, but a rigorous precision study with multiple annotators remains future work. Finally, the term ``error'' carries different meanings across the two channels---regex flags syntactic events while the LLM labels semantic failures---so the 8.2$\times$ multiplier reflects a broader definition of error rather than 8.2$\times$ more ``real'' mistakes.
 
 
 % ============================================================
