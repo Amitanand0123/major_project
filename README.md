@@ -223,6 +223,7 @@ flowchart TB
 5 cognitive modules, 20 error types (19 predefined + 1 emergent):
 
 ```mermaid
+%%{init: {'theme': 'default'}}%%
 mindmap
   root((AgentError<br/>Taxonomy))
     Memory
