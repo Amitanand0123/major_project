@@ -46,7 +46,7 @@ class MasterPipeline:
         Initialize master pipeline
 
         Args:
-            llm: Language model (Groq, OpenAI, Claude, or local)
+            llm: Language model (HuggingFace)
             output_base_dir: Base directory for all outputs
         """
         self.llm = llm
@@ -352,116 +352,74 @@ class MasterPipeline:
         return results
 
 
-def setup_llm(provider: str = "groq", api_key: str = None):
+def setup_llm(provider: str = "huggingface", model_name: str = None):
     """
-    Setup LLM based on provider
+    Setup LLM using HuggingFace transformers (for Colab GPU)
 
     Args:
-        provider: 'groq', 'openai', 'anthropic', or 'ollama'
-        api_key: API key (not needed for ollama)
+        provider: 'huggingface' (only supported provider)
+        model_name: HuggingFace model name (default: Qwen/Qwen2.5-Coder-14B-Instruct)
 
     Returns:
         LLM instance
     """
-    if provider == "groq":
-        from groq import Groq
-        class GroqLLM:
-            def __init__(self, api_key):
-                self.client = Groq(api_key=api_key)
-                self.model = "llama-3.3-70b-versatile"
+    if provider != "huggingface":
+        raise ValueError(f"Unknown provider: {provider}. Only 'huggingface' is supported.")
 
-            def invoke(self, prompt):
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": str(prompt)}],
-                    temperature=0.0,
-                    max_tokens=1000
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
+    class HuggingFaceLLM:
+        def __init__(self, model_name=None):
+            self.model_name = model_name or os.getenv("HF_MODEL", "Qwen/Qwen2.5-Coder-14B-Instruct")
+            self.max_prompt_length = 12000
+            print(f"Loading {self.model_name} ...")
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            self.model.eval()
+            print(f"✓ {self.model_name} loaded on {self.model.device}")
+
+        def invoke(self, prompt):
+            prompt_str = str(prompt)
+            if len(prompt_str) > self.max_prompt_length:
+                prompt_str = prompt_str[:self.max_prompt_length] + "\n\n[TRUNCATED - analyze what is shown above]\n"
+
+            import time
+            start = time.time()
+            print(f"🔄 HuggingFace inference (prompt: {len(prompt_str)} chars)...")
+
+            messages = [{"role": "user", "content": prompt_str}]
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=1000,
+                    temperature=0.01,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
                 )
-                return response.choices[0].message.content
 
-        return GroqLLM(api_key=api_key or os.getenv("GROQ_API_KEY"))
+            # Decode only new tokens
+            new_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-    elif provider == "openai":
-        from openai import OpenAI
-        class OpenAILLM:
-            def __init__(self, api_key):
-                self.client = OpenAI(api_key=api_key)
-                self.model = "gpt-4-turbo-preview"
+            elapsed = time.time() - start
+            print(f"✓ Response in {elapsed:.1f}s ({len(new_tokens)} tokens)")
+            return response
 
-            def invoke(self, prompt):
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": str(prompt)}],
-                    temperature=0.0,
-                    max_tokens=1000
-                )
-                return response.choices[0].message.content
-
-        return OpenAILLM(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-
-    elif provider == "anthropic":
-        from anthropic import Anthropic
-        class AnthropicLLM:
-            def __init__(self, api_key):
-                self.client = Anthropic(api_key=api_key)
-                self.model = "claude-3-5-sonnet-20241022"
-
-            def invoke(self, prompt):
-                response = self.client.messages.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": str(prompt)}],
-                    temperature=0.0,
-                    max_tokens=1000
-                )
-                return response.content[0].text
-
-        return AnthropicLLM(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
-
-    elif provider == "ollama":
-        # Real Ollama integration using local models
-        import ollama
-        class OllamaLLM:
-            def __init__(self):
-                self.model = "qwen2.5-coder:7b"  # Fast code-specific model
-                self.max_prompt_length = 8000  # Truncate for 7B model context limits
-                print(f"✓ Ollama LLM initialized with model: {self.model}")
-
-            def invoke(self, prompt, timeout=600):
-                prompt_str = str(prompt)
-                if len(prompt_str) > self.max_prompt_length:
-                    prompt_str = prompt_str[:self.max_prompt_length] + "\n\n[TRUNCATED - analyze what is shown above]\n"
-                    prompt = prompt_str
-                print(f"🔄 Calling Ollama (prompt length: {len(str(prompt))} chars)...")
-                import time
-                import concurrent.futures
-                start = time.time()
-
-                def _call_ollama():
-                    return ollama.chat(
-                        model=self.model,
-                        messages=[{"role": "user", "content": str(prompt)}],
-                        options={
-                            "temperature": 0.0,
-                            "num_predict": 1000  # max tokens
-                        }
-                    )
-
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(_call_ollama)
-                    try:
-                        response = future.result(timeout=timeout)
-                        elapsed = time.time() - start
-                        print(f"✓ Ollama responded in {elapsed:.1f}s")
-                        return response['message']['content']
-                    except concurrent.futures.TimeoutError:
-                        elapsed = time.time() - start
-                        print(f"⚠ Ollama timed out after {elapsed:.0f}s, skipping...")
-                        return "TIMEOUT: Unable to analyze this step"
-
-        return OllamaLLM()
-
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    return HuggingFaceLLM(model_name=model_name)
 
 
 async def main():
@@ -473,9 +431,9 @@ async def main():
     parser = argparse.ArgumentParser(description="Run complete code domain extension pipeline")
     parser.add_argument("--mode", choices=["demo", "full"], default="demo",
                        help="Run mode: demo (sample) or full (experiments)")
-    parser.add_argument("--provider", choices=["groq", "openai", "anthropic", "ollama"],
-                       default="ollama", help="LLM provider")
-    parser.add_argument("--api-key", help="API key for LLM provider")
+    parser.add_argument("--provider", choices=["huggingface"],
+                       default="huggingface", help="LLM provider")
+    parser.add_argument("--model-name", help="HuggingFace model name (default: Qwen/Qwen2.5-Coder-14B-Instruct)")
     parser.add_argument("--trajectory-dir", help="Directory with SWE-bench trajectories (full mode)")
     parser.add_argument("--max-trajectories", type=int, default=100,
                        help="Maximum trajectories to process")
@@ -490,7 +448,7 @@ async def main():
     print("="*80)
     print(f"Provider: {args.provider}")
 
-    llm = setup_llm(provider=args.provider, api_key=args.api_key)
+    llm = setup_llm(provider=args.provider, model_name=args.model_name)
     print(f"✓ LLM initialized: {args.provider}")
 
     # Create pipeline
