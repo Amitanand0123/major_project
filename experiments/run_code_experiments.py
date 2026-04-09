@@ -312,7 +312,7 @@ class CodeExperimentRunner:
         return aggregate_stats
 
     def _save_individual_result(self, result: Dict):
-        """Save individual trajectory result"""
+        """Save individual trajectory result and sync to Google Drive if available"""
         instance_id = result['instance_id']
         filename = f"{instance_id}_analysis.json"
         filepath = self.output_dir / "individual" / filename
@@ -321,6 +321,22 @@ class CodeExperimentRunner:
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2)
+
+        # Auto-sync to Google Drive (Colab only)
+        drive_base = Path('/content/drive/MyDrive/agentdebug')
+        if drive_base.exists():
+            import shutil
+            try:
+                # Mirror the local path structure on Drive
+                # output_dir is like: results_1000_study/batch_01/run_XXX/experiments
+                # We replicate the full relative path under drive_base's parent
+                local_base = Path('results_1000_study')
+                rel_path = filepath.relative_to(local_base)
+                drive_filepath = drive_base / 'results_1000_study' / rel_path
+                drive_filepath.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(filepath, drive_filepath)
+            except Exception:
+                pass  # Don't crash if Drive sync fails
 
     def _save_aggregate_results(self, stats: Dict, all_results: List[Dict]):
         """Save aggregate results"""
