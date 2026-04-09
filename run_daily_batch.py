@@ -241,8 +241,9 @@ async def main():
     parser = argparse.ArgumentParser(description="Run daily batch of 50 trajectories")
     parser.add_argument("--trajectory-dir", required=True,
                        help="Directory with all trajectory files")
-    parser.add_argument("--provider", choices=["groq", "openai", "anthropic", "ollama"],
-                       default="ollama", help="LLM provider")
+    parser.add_argument("--provider", choices=["huggingface"],
+                       default="huggingface", help="LLM provider")
+    parser.add_argument("--model-name", help="HuggingFace model name (default: Qwen/Qwen2.5-Coder-14B-Instruct)")
     parser.add_argument("--base-dir", default="results_1000_study",
                        help="Base directory for all batches")
     parser.add_argument("--rerun", action="store_true",
@@ -256,7 +257,7 @@ async def main():
     print("=" * 80)
     print(f"Provider: {args.provider}")
 
-    llm = setup_llm(provider=args.provider)
+    llm = setup_llm(provider=args.provider, model_name=args.model_name)
     print(f"✓ LLM initialized: {args.provider}")
 
     # Create batch runner

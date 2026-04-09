@@ -358,7 +358,7 @@ def setup_llm(provider: str = "huggingface", model_name: str = None):
 
     Args:
         provider: 'huggingface' (only supported provider)
-        model_name: HuggingFace model name (default: Qwen/Qwen2.5-Coder-14B-Instruct)
+        model_name: HuggingFace model name (default: Qwen/Qwen2.5-Coder-7B-Instruct)
 
     Returns:
         LLM instance
@@ -366,26 +366,33 @@ def setup_llm(provider: str = "huggingface", model_name: str = None):
     if provider != "huggingface":
         raise ValueError(f"Unknown provider: {provider}. Only 'huggingface' is supported.")
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     import torch
 
     class HuggingFaceLLM:
         def __init__(self, model_name=None):
-            self.model_name = model_name or os.getenv("HF_MODEL", "Qwen/Qwen2.5-Coder-14B-Instruct")
+            self.model_name = model_name or os.getenv("HF_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
             self.max_prompt_length = 12000
             print(f"Loading {self.model_name} ...")
 
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name, trust_remote_code=True
             )
+
+            # 4-bit quantization so 14B model fits on T4 (15.6 GB VRAM)
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.float16,
+                quantization_config=bnb_config,
                 device_map="auto",
                 trust_remote_code=True
             )
             self.model.eval()
-            print(f"✓ {self.model_name} loaded on {self.model.device}")
+            print(f"✓ {self.model_name} loaded (4-bit quantized)")
 
         def invoke(self, prompt):
             prompt_str = str(prompt)
@@ -433,7 +440,7 @@ async def main():
                        help="Run mode: demo (sample) or full (experiments)")
     parser.add_argument("--provider", choices=["huggingface"],
                        default="huggingface", help="LLM provider")
-    parser.add_argument("--model-name", help="HuggingFace model name (default: Qwen/Qwen2.5-Coder-14B-Instruct)")
+    parser.add_argument("--model-name", help="HuggingFace model name (default: Qwen/Qwen2.5-Coder-7B-Instruct)")
     parser.add_argument("--trajectory-dir", help="Directory with SWE-bench trajectories (full mode)")
     parser.add_argument("--max-trajectories", type=int, default=100,
                        help="Maximum trajectories to process")
